@@ -1,65 +1,135 @@
-# 🎧 MH-Dowsample (Audio Organizer Pro v4.1)
+<div align="center">
+  <img src="brand/mh-dowsample-avatar.svg" alt="MH-Dowsample logo" width="150">
+  <h1>MH-Dowsample</h1>
+  <p><strong>A local-first audio sample organizer for music producers.</strong></p>
+  <p>Analyze quality, classify sounds, normalize audio, remove duplicates, and build a clean,<br>searchable sample library from one command-line workflow.</p>
+  <p>
+    <a href="https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO/actions/workflows/ci.yml"><img src="https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.11+"></a>
+    <a href="https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO"><img src="https://img.shields.io/badge/version-4.1.0-B8FF2C?labelColor=090B0D" alt="Version 4.1.0"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/studiozengermany-cmd/MH---DOWSAMPLE-PRO" alt="MIT License"></a>
+  </p>
+  <p><a href="#features">Features</a> · <a href="#quick-start">Quick start</a> · <a href="#usage">Usage</a> · <a href="#telegram-bot">Telegram bot</a> · <a href="#development">Development</a></p>
+</div>
 
-A production-grade, CLI-first audio sample organizer tailored for music producers. It automatically inspects quality, classifies content (loop/one-shot/fx), estimates BPM & Key, normalizes to tagged PCM WAV, deduplicates with SHA-256, and maintains an SQLite inventory.
+---
 
-## ✨ Key Features
-- **Smart Classification**: Uses `librosa` for spectral analysis to detect BPM, Key, and audio type (Loop, One-shot, FX, Ambient, DnB, Trap, House, etc.).
-- **Auto-Normalization**: Converts all formats to standard 16/24-bit PCM WAV.
-- **Concurrent Pipeline**: Blazing fast processing with multi-threading and an SQLite-backed metadata store.
-- **Multi-source Web Crawler**: Accepts direct audio URLs or catalogue pages from any public website. It discovers audio through network responses, JSON APIs, HTML media attributes, resource timing, and play controls; site-specific adapters remain optional optimizations.
-- **Telegram Bot Integration**: Trigger processing remotely via a private admin bot.
+## Overview
 
-## 🚀 Getting Started
+MH-Dowsample turns mixed folders of audio files into a predictable library that is easier to browse
+from a DAW. The pipeline inspects every file, estimates musical metadata, converts accepted audio to
+tagged 16-bit PCM WAV, detects duplicates with SHA-256, and records the result in SQLite.
 
-### 1. Requirements
-- Python 3.11+
-- Node.js on PATH (recommended on Windows for the Playwright driver)
-- `ffmpeg` and `ffprobe` installed and added to system PATH.
+The application runs locally. Audio files, browser sessions, the SQLite database, credentials, logs,
+and generated libraries are excluded from Git and remain on the user's machine.
 
-### 2. Installation
-```bash
-# Create and activate virtual environment
-python -m venv .venv
-.\.venv\Scripts\activate   # Windows
+## Features
 
-# Install dependencies
-python -m pip install -r requirements.txt -r requirements-dev.txt
+| Capability | What it does |
+| --- | --- |
+| Quality inspection | Checks duration, bitrate, silence ratio, and readable audio content before accepting a file. |
+| Content classification | Distinguishes loops, one-shots, and FX; estimates BPM, musical key, and a practical genre hint. |
+| Consistent output | Normalizes accepted audio and exports tagged 44.1 kHz, 16-bit PCM WAV files. |
+| Clean library layout | Produces readable, content-first filenames and DAW-friendly folders. |
+| Duplicate protection | Uses SHA-256 fingerprints and an SQLite inventory to avoid duplicate imports. |
+| Concurrent processing | Processes batches with configurable worker and batch counts. |
+| Guarded web discovery | Finds public audio assets through direct URLs, page resources, JSON responses, and media controls. |
+| Private Telegram control | Restricts bot commands to the configured administrator account. |
 
-# Install the headless Chromium runtime used by the crawler
-python -m playwright install chromium --only-shell
+## Processing flow
 
-# Setup environment variables
-copy .env.example .env
+```mermaid
+flowchart LR
+    A["Local folder or approved URL"] --> B["Quality gate"]
+    B -->|Rejected| C["Report reason"]
+    B -->|Accepted| D["Classify and analyze"]
+    D --> E["Normalize and tag WAV"]
+    E --> F["SHA-256 duplicate check"]
+    F --> G["Organized library"]
+    F --> H["SQLite inventory"]
 ```
 
-### 3. Configuration
-Edit `.env` to match your local paths.
-- Define `OUTPUT_DIR`, `TEMP_DIR`, `DB_PATH`.
-- Optionally tune `CRAWL_WAIT_SEC`, `CRAWL_TIMEOUT_SEC`, and `CRAWL_LAUNCH_TIMEOUT_MS`.
-- Add `TELEGRAM_TOKEN` and `ADMIN_USER_ID` if using the bot.
+## Quick start
 
-## 🛠️ Usage
+### Requirements
 
-### Organize Local Samples
-```bash
-# Basic run
-python organize.py --input ./raw_samples --output ./organized
+- Python 3.11 or newer
+- FFmpeg and FFprobe available on `PATH`
+- Node.js on `PATH` is recommended on Windows for the Playwright driver
 
-# High-performance run with 8 workers
-python organize.py --input ./raw_samples --workers 8
+### Install
 
-# Dry run (test classification without modifying files)
-python organize.py --input ./raw_samples --dry-run
+```powershell
+git clone https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO.git
+cd MH---DOWSAMPLE-PRO
 
-# View database stats
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m playwright install chromium --only-shell
+
+Copy-Item .env.example .env
+```
+
+For development tools, install the additional requirements:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+```
+
+### Configure
+
+Edit `.env` before the first run. The defaults use folders inside the project directory.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `DOWNLOAD_DIR` | Retained source downloads | `./downloads` |
+| `OUTPUT_DIR` | Organized WAV library | `./organized` |
+| `DB_PATH` | SQLite inventory | `./data/database.db` |
+| `TARGET_SAMPLE_RATE` | Output sample rate | `44100` |
+| `WORKERS` | Concurrent processing workers | `4` |
+| `BATCH_SIZE` | Files processed per batch | `50` |
+| `TELEGRAM_TOKEN` | Optional Telegram bot token | empty |
+| `ADMIN_USER_ID` | Allowed Telegram user ID | `0` |
+
+See [`.env.example`](.env.example) for every available quality, crawler, timeout, and path setting.
+
+## Usage
+
+> [!IMPORTANT]
+> A normal run moves successfully processed source files out of the input folder. Start with
+> `--dry-run`, or add `--copy` when the original files must remain in place.
+
+Preview classification without changing files:
+
+```powershell
+python organize.py --input .\raw_samples --dry-run
+```
+
+Organize files while preserving the originals:
+
+```powershell
+python organize.py --input .\raw_samples --output .\organized --copy
+```
+
+Run a larger batch with eight workers:
+
+```powershell
+python organize.py --input .\raw_samples --workers 8 --batch-size 100 --copy
+```
+
+Inspect the current inventory or rebuild an older library layout:
+
+```powershell
 python organize.py --stats
-
-# Upgrade files created by an older version to the clean layout
 python organize.py --rebuild-layout
 ```
 
-**Output Structure:**
-The local library is organized for browsing in a DAW, independently of the website it came from:
+Run `python organize.py --help` for the complete CLI reference.
+
+### Output layout
 
 ```text
 organized/
@@ -69,22 +139,64 @@ organized/
 └── Unsorted/Readable Name.wav
 ```
 
-The source website remains searchable metadata in SQLite. Retained originals use the same content-first layout under `downloads/<Source>/`; long CDN hashes are kept out of visible filenames.
-The bot checks the layout version on startup and performs any required one-time migration automatically. Every newly downloaded file is named and filed during the normal processing flow.
+The source website remains searchable metadata in SQLite. Retained downloads use the same
+content-first naming approach under `downloads/<Source>/`.
 
-### Run Telegram Bot
-```bash
+## Telegram bot
+
+Set `TELEGRAM_TOKEN` and `ADMIN_USER_ID` in `.env`, then start the bot:
+
+```powershell
 python bot.py
 ```
-Commands: `/start`, `/organize PATH`, `/stats`. (Only works for the configured `ADMIN_USER_ID`).
 
-## 🧪 Testing & Verification
-The project maintains an enforced 68% minimum coverage gate alongside linting, type checks, and security scans:
-```bash
-# Run test suite with coverage
-python -m pytest tests -v --cov=.
+| Command | Purpose |
+| --- | --- |
+| `/start` | Display the usage guide. |
+| `/stats` | Show library statistics. |
+| `/path` | Show the configured output directory. |
+| `/dangnhap` | Open an interactive website login session for a supplied URL. |
+| `/organize` | Process a local folder. |
 
-# Linter and Type checking
+Plain text URLs sent by the configured administrator are passed to the guarded crawler. Use this
+feature only for content you are authorized to access and download.
+
+## Development
+
+The GitHub Actions matrix validates Python 3.11 and 3.12 with tests, coverage, linting, type checks,
+security analysis, and an import smoke test.
+
+```powershell
+python -m pytest tests -v --cov=. --cov-fail-under=68
 python -m ruff check .
 python -m mypy config.py exceptions.py quality_gate.py processor.py organizer.py organize.py crawler.py bot.py utils tools --ignore-missing-imports
+python -m bandit -r . -x ./tests,./tools -ll
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a change.
+
+## Project structure
+
+```text
+MH-Dowsample/
+├── organize.py           # CLI entry point and batch orchestration
+├── quality_gate.py       # Audio inspection and classification
+├── processor.py          # WAV conversion, normalization, and tags
+├── organizer.py          # Library placement and duplicate handling
+├── library_layout.py     # Readable content-first paths
+├── crawler.py            # Guarded browser and HTTP discovery
+├── bot.py                # Private Telegram interface
+├── utils/                # Database, paths, retries, and cleanup
+├── tools/                # Development and benchmark utilities
+└── tests/                # Unit, concurrency, and end-to-end tests
+```
+
+## Privacy and repository hygiene
+
+The repository intentionally ignores credentials, virtual environments, browser profiles, databases,
+downloaded audio, generated libraries, logs, caches, backups, and local working notes. Never commit a
+real `.env` file or third-party audio content.
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright © 2026 Minh Hieu Producer.
