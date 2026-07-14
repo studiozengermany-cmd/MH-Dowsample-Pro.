@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc" shape-rendering="geometricPrecision">
+  <title id="title">MH Dowsample avatar mark</title>
+  <desc id="desc">A precision-built MH monogram for a professional audio sample organizer.</desc>
+
+  <!-- Full-bleed field: survives square and circular avatar crops. -->
+  <rect width="1024" height="1024" fill="#090B0D"/>
+
+  <!--
+    Unified MH geometry.
+    Every coordinate lands on an 8-unit grid. The M's right stem is also
+    the H's left stem, so the mark reads as one engineered system.
+  -->
+  <path fill="#F3F4EF" d="
+    M176 752V272H296L440 448L584 272H704V432H816V272H928V752H816V592H704V752H584V456L440 632L296 456V752Z
+  "/>
+
+  <!-- Signal state is embedded in the H crossbar, never added as decoration. -->
+  <rect x="704" y="504" width="112" height="16" fill="#B8FF2C"/>
+</svg>

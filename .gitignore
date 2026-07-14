@@ -1,0 +1,39 @@
+# Secrets and local environments
+.env
+.env.*
+!.env.example
+.venv/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime data and generated audio
+data/
+organized/
+downloads/
+logs/
+raw_samples/
+*.db
+*.db-wal
+*.db-shm
+*.part
+
+# Local assistant state, backups, and working drafts
+.agents/
+.ai-backups/
+.claude/
+.code_ideald/
+Code.md
+test_pw.py
+AWS_ACTIVATE_FOUNDERS_APPLICATION.md
+
+# Operating-system files
+.DS_Store
+Thumbs.db

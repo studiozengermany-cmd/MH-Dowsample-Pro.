@@ -1,0 +1,11 @@
+python-dotenv>=1.0,<2
+rich>=13.7,<15
+numpy>=1.26,<3
+librosa>=0.10.2,<1
+soundfile>=0.12,<1
+pydub>=0.25,<1
+mutagen>=1.47,<2
+requests>=2.32,<3
+playwright>=1.44,<2
+python-telegram-bot>=21,<23
+scikit-learn>=1.4,<2
