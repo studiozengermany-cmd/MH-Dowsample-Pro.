@@ -120,10 +120,20 @@ class QualityGate:
                 pass
         if duration is None:
             try:
-                y, sr = self._load_audio(filepath)
-                mono = librosa.to_mono(y) if y.ndim > 1 else y
-                duration = len(mono) / sr
-            except Exception:
+                cmd_dur = [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(filepath),
+                ]
+                completed_dur = subprocess.run(cmd_dur, check=True, capture_output=True, text=True, timeout=10)
+                dur_str = completed_dur.stdout.strip()
+                if dur_str and dur_str != "N/A":
+                    duration = float(dur_str)
+                else:
+                    duration = 0.0
+            except (OSError, subprocess.SubprocessError, ValueError):
                 duration = 0.0
         size_bits = filepath.stat().st_size * 8
         return round(size_bits / duration / 1000) if duration and duration > 0 else 0

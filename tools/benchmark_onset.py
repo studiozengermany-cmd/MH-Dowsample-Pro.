@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import subprocess
+
 import librosa
 import numpy as np
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
@@ -72,7 +74,22 @@ def load_samples(root: Path) -> list[Sample]:
 def classify_with_weights(
     sample: Sample, weights: tuple[float, float, float, float], threshold: float
 ) -> str:
-    duration = librosa.get_duration(path=sample.path)
+    try:
+        cmd_dur = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(sample.path),
+        ]
+        completed_dur = subprocess.run(cmd_dur, check=True, capture_output=True, text=True, timeout=10)
+        dur_str = completed_dur.stdout.strip()
+        if dur_str and dur_str != "N/A":
+            duration = float(dur_str)
+        else:
+            duration = 0.0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        duration = 0.0
     if duration < 0.8:
         return "one-shot"
     score = sum(feature * weight for feature, weight in zip(sample.features, weights, strict=True))
