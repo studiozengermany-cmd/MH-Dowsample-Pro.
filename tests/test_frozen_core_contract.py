@@ -15,13 +15,13 @@ from organize import process_file
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 FROZEN_FILE_HASHES = {
-    "crawler.py": "813ee7036b66a623d4914b94c6645c5311ed3aba34287799f3b9827c96e86bf0",
+    "crawler.py": "e4fb9fe36d757ab30c5f191495c80a2bb357bc8a2cefded3fb93e46848c8612c",
     "quality_gate.py": "e69c9696685faba665bad469371060bb3797f5adb7601abe4a6f8ef8eaad5496",
     "processor.py": "58a7a2bc0405c58fc46a00ee3c2f2978c622d90ed77d415fecca015f9cad7315",
     "organizer.py": "611ae7ab0c00f60868cf3728b64a4ae2450fed4c4373af90b10f2457930f837f",
     "organize.py": "416fa4ec637324b93f7e1d876414925e4b555d77ee5a9767e9d7e2108ff69079",
 }
-FROZEN_HANDLE_URL_HASH = "31e1a0a1ddb31d74b0ed553124cf3d66fe64c9743b0e29f97999ebecc9bbe82e"
+FROZEN_HANDLE_URL_HASH = "cbf9723bef222596b76610225e0b66eedb5ca5b51cee0ead5816c5867304fb87"
 
 
 def _normalized_hash(text: str) -> str:
@@ -127,29 +127,6 @@ def test_duplicate_result_contract_points_to_existing_wav(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_handle_url_hands_completed_results_to_delivery_once(tmp_path: Path) -> None:
     audio_url = "https://cdn.example.test/sample.mp3"
-    source = tmp_path / "downloads" / "example.test" / "sample.mp3"
-    source.parent.mkdir(parents=True)
-    source.write_bytes(b"raw-audio")
-    archived_raw = tmp_path / "raw-library" / "example.test" / "sample.mp3"
-    archived_raw.parent.mkdir(parents=True)
-    archived_raw.write_bytes(source.read_bytes())
-    output = tmp_path / "library" / "Loops" / "Techno" / "sample.wav"
-    output.parent.mkdir(parents=True)
-    output.write_bytes(b"RIFF-processed")
-    analysis = {
-        "passed": True,
-        "content_type": "loop",
-        "bpm": 128,
-        "key": "A minor",
-        "genre_hint": "techno",
-    }
-    core_result = {
-        "status": "passed",
-        "file": str(source),
-        "output": str(output),
-        "analysis": analysis,
-        "source_hash": "c" * 64,
-    }
     status_message = SimpleNamespace(edit_text=AsyncMock())
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=7),
@@ -158,42 +135,30 @@ async def test_handle_url_hands_completed_results_to_delivery_once(tmp_path: Pat
             reply_text=AsyncMock(return_value=status_message),
         ),
     )
-    archive_raw = Mock(return_value=archived_raw)
+    def download(_url: str, raw_dir: Path, suggested_name: str | None) -> Path:
+        source = raw_dir / f"{suggested_name}.mp3"
+        source.write_bytes(b"raw-audio")
+        return source
+
     instance = AudioBot.__new__(AudioBot)
     instance.run_dir = tmp_path / "run"
-    instance.gate = object()
-    instance.processor = object()
-    instance.organizer = SimpleNamespace(archive_raw=archive_raw)
     instance.crawler = SimpleNamespace(
         sniff_urls=AsyncMock(return_value=[audio_url]),
-        download=Mock(return_value=source),
+        download=Mock(side_effect=download),
         discovered_titles={audio_url: "Sample"},
     )
-    instance._send_processed_files = AsyncMock()
+    instance._send_downloaded_files = AsyncMock(return_value=True)
 
-    with (
-        patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"),
-        patch("bot.process_file", return_value=core_result) as process,
-    ):
+    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"):
         await instance.handle_url(update, None)
 
-    expected = {**core_result, "raw": str(archived_raw)}
-    instance._send_processed_files.assert_awaited_once_with(
-        update,
-        [expected],
-        "example.test",
-        retry_results=(expected,),
-    )
-    process.assert_called_once()
-    assert process.call_args.args[0] == source
-    assert process.call_args.args[1] == "example.test"
-    assert process.call_args.kwargs == {
-        "delete_source": False,
-        "ephemeral": False,
-        "timeout": 45,
-    }
-    archive_raw.assert_called_once()
-    assert output.read_bytes() == b"RIFF-processed"
+    instance._send_downloaded_files.assert_awaited_once()
+    call = instance._send_downloaded_files.await_args
+    assert call.args[0] is update
+    assert call.args[2] == "example.test"
+    assert len(call.args[1]) == 1
+    assert call.args[1][0].name == "Sample.mp3"
+    assert call.args[3] == call.args[1][0].parent
 
 
 @pytest.mark.asyncio

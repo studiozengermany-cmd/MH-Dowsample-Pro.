@@ -499,6 +499,28 @@ def test_suggested_name_replaces_opaque_cdn_hash(tmp_path: Path, monkeypatch: py
     assert result.name == "Warm Vinyl Kick.mp3"
 
 
+def test_catalogue_title_overrides_cdn_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = SimpleNamespace(pre_download_ok=lambda *_args: (True, "ok"))
+    response = SimpleNamespace(
+        status_code=200,
+        headers={},
+        history=[],
+        url="https://cdn.example/preview-file.mp3",
+        iter_content=lambda _size: iter([b"data"]),
+        close=lambda: None,
+    )
+    session = SimpleNamespace(get=lambda *args, **kwargs: response, close=lambda: None, headers={})
+    instance = AudioCrawler(tmp_path, gate=gate, session=session)
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
+
+    result = instance.download(response.url, suggested_name="DPTECH4_128_Am_Melody")
+
+    assert result is not None
+    assert result.name == "DPTECH4_128_Am_Melody.mp3"
+
+
 def test_extensionless_audio_uses_title_and_content_type(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -12,6 +12,7 @@ from telegram.error import TelegramError, TimedOut
 from delivery import (
     DeliveryService,
     build_delivery_manifest,
+    build_original_archives,
     build_result_archive,
     build_result_archives,
 )
@@ -116,6 +117,22 @@ def test_single_part_zip_preserves_library_folder(tmp_path: Path) -> None:
     assert [path.name for path in archives] == ["splice.com-samples.zip"]
     with zipfile.ZipFile(archives[0]) as archive:
         assert archive.namelist() == ["Loops/Techno/sample.wav"]
+
+
+def test_original_archive_stores_source_audio_without_recompression(tmp_path: Path) -> None:
+    output_root = tmp_path / "downloads"
+    sample = output_root / "Original Source Name.mp3"
+    sample.parent.mkdir(parents=True)
+    sample.write_bytes(b"already-compressed-audio")
+
+    archives = build_original_archives(
+        [sample], output_root, tmp_path / "run", "splice.com-samples", 1024
+    )
+
+    with zipfile.ZipFile(archives[0]) as archive:
+        info = archive.getinfo("Original Source Name.mp3")
+        assert info.compress_type == zipfile.ZIP_STORED
+        assert archive.read(info) == sample.read_bytes()
 
 
 def test_multiple_zip_parts_are_named_and_partitioned_deterministically(tmp_path: Path) -> None:

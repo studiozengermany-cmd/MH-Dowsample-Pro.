@@ -113,12 +113,18 @@ def deliverable_paths(results: Sequence[Mapping[str, Any]]) -> list[Path]:
     return list(build_delivery_manifest(results).paths)
 
 
-def build_result_archive(paths: Sequence[Path], output_root: Path, archive_path: Path) -> Path:
+def build_result_archive(
+    paths: Sequence[Path],
+    output_root: Path,
+    archive_path: Path,
+    *,
+    compression: int = zipfile.ZIP_DEFLATED,
+) -> Path:
     """Bundle result files while preserving organized library folders."""
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     used_names: set[str] = set()
     try:
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        with zipfile.ZipFile(archive_path, "w", compression=compression) as archive:
             for path in paths:
                 try:
                     relative = path.resolve().relative_to(output_root.resolve())
@@ -199,6 +205,8 @@ def build_result_archives(
     archive_dir: Path,
     archive_stem: str,
     max_part_bytes: int,
+    *,
+    compression: int = zipfile.ZIP_DEFLATED,
 ) -> list[Path]:
     """Build ZIP parts whose final on-disk sizes do not exceed the upload limit."""
     if max_part_bytes <= 0:
@@ -229,7 +237,12 @@ def build_result_archives(
             batch = pending.pop(0)
             probe_index += 1
             probe = probe_dir / f"part-{probe_index}.zip"
-            build_result_archive(batch, output_root, probe)
+            if compression == zipfile.ZIP_DEFLATED:
+                build_result_archive(batch, output_root, probe)
+            else:
+                build_result_archive(
+                    batch, output_root, probe, compression=compression
+                )
             if probe.stat().st_size <= max_part_bytes:
                 staged.append(probe)
                 continue
@@ -251,6 +264,24 @@ def build_result_archives(
         except Exception:
             cleanup_archives(archives)
             raise
+
+
+def build_original_archives(
+    paths: Sequence[Path],
+    output_root: Path,
+    archive_dir: Path,
+    archive_stem: str,
+    max_part_bytes: int,
+) -> list[Path]:
+    """Package already-compressed source audio without recompressing it."""
+    return build_result_archives(
+        paths,
+        output_root,
+        archive_dir,
+        archive_stem,
+        max_part_bytes,
+        compression=zipfile.ZIP_STORED,
+    )
 
 
 def _safe_archive_stem(site: str) -> str:
@@ -285,6 +316,7 @@ class DeliveryService:
         upload_retries: int,
         upload_timeout_sec: float,
         archive_builder: ArchiveBuilder = build_result_archives,
+        original_files: bool = False,
     ) -> None:
         if owner_mode not in {"local", "telegram", "both"}:
             raise ValueError("owner_mode must be local, telegram, or both")
@@ -301,6 +333,7 @@ class DeliveryService:
         self.upload_retries = upload_retries
         self.upload_timeout_sec = upload_timeout_sec
         self.archive_builder = archive_builder
+        self.original_files = original_files
 
     async def send_archive_with_retry(
         self,
@@ -461,11 +494,18 @@ class DeliveryService:
                             "✅ <b>Gói sample đã sẵn sàng</b> — "
                             f"gói <b>{part_number}</b>\n"
                         )
-                    caption = (
-                        heading
-                        + "\n".join(_status_lines(manifest))
-                        + "\nCác file trong gói giữ nguyên thư mục phân loại."
-                    )
+                    if self.original_files:
+                        caption = (
+                            heading
+                            + f"• File gốc: <b>{manifest.ready_count}</b>"
+                            + "\nTên file nguồn được giữ nguyên."
+                        )
+                    else:
+                        caption = (
+                            heading
+                            + "\n".join(_status_lines(manifest))
+                            + "\nCác file trong gói giữ nguyên thư mục phân loại."
+                        )
                     try:
                         sent = await self.send_archive_with_retry(
                             message, archive_path, caption

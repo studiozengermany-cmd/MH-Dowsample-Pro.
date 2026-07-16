@@ -93,8 +93,8 @@ def test_progress_marks_completed_steps_and_only_current_step_as_pending() -> No
     assert "⏳ Đang tải tệp gốc: 2/5" in downloading
     assert "✅ <b>Đã tải tệp gốc:</b> 4" in analyzing
     assert "⏳ Đang kiểm tra và phân loại: 1/4" in analyzing
-    assert "✅ <b>Đã kiểm tra và phân loại:</b> 4" in completed
-    assert "✅ <b>Hoàn tất xử lý</b>" in completed
+    assert "✅ <b>Đã gửi file gốc:</b> 4" in completed
+    assert "✅ <b>Hoàn tất</b>" in completed
 
 
 def test_failed_progress_keeps_received_step_and_marks_failure() -> None:
@@ -282,7 +282,7 @@ async def test_empty_discovery_fallback_message_has_no_login_button() -> None:
 
 
 @pytest.mark.asyncio
-async def test_classification_updates_after_first_file_and_every_five(tmp_path) -> None:
+async def test_download_batches_send_original_files_immediately(tmp_path) -> None:
     status_message = SimpleNamespace(edit_text=AsyncMock())
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=77),
@@ -304,35 +304,24 @@ async def test_classification_updates_after_first_file_and_every_five(tmp_path) 
         download=download,
         discovered_titles={},
     )
-    bot.gate = SimpleNamespace()
-    bot.processor = SimpleNamespace()
-    bot.organizer = SimpleNamespace()
     bot.run_dir = tmp_path / "run"
-    bot._send_processed_files = AsyncMock()
+    bot._send_downloaded_files = AsyncMock(return_value=True)
 
-    def process(downloaded, *_args, **_kwargs):
-        return {"status": "passed", "output": str(downloaded)}
-
-    with patch("bot.process_file", side_effect=process), patch(
-        "bot.DEFAULT_WORKERS", 2
-    ), patch("bot.JOB_BATCH_FILES", 2):
+    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch(
+        "bot.JOB_BATCH_FILES", 2
+    ):
         await bot.handle_url(update, None)
 
     progress_messages = [call.args[0] for call in status_message.edit_text.await_args_list]
-    assert any("1/6" in text for text in progress_messages)
-    assert any("5/6" in text for text in progress_messages)
-    assert bot._send_processed_files.await_count == 3
-    assert [len(call.args[1]) for call in bot._send_processed_files.await_args_list] == [2, 2, 2]
+    assert any("Đang đóng gói và gửi" in text for text in progress_messages)
+    assert bot._send_downloaded_files.await_count == 3
     assert [
-        len(call.kwargs["retry_results"])
-        for call in bot._send_processed_files.await_args_list
-    ] == [2, 4, 6]
+        len(call.args[1]) for call in bot._send_downloaded_files.await_args_list
+    ] == [2, 2, 2]
 
 
 @pytest.mark.asyncio
-async def test_hung_tenth_file_is_skipped_and_batch_still_delivers(tmp_path) -> None:
-    import time
-
+async def test_url_delivery_never_calls_audio_processing(tmp_path) -> None:
     status_message = SimpleNamespace(edit_text=AsyncMock())
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=77),
@@ -348,37 +337,24 @@ async def test_hung_tenth_file_is_skipped_and_batch_still_delivers(tmp_path) -> 
         path.write_bytes(b"audio")
         return path
 
-    def process(downloaded, *_args, **_kwargs):
-        if downloaded.name == "9.mp3":
-            time.sleep(0.2)
-        return {"status": "passed", "output": str(downloaded)}
-
     bot = AudioBot.__new__(AudioBot)
     bot.crawler = SimpleNamespace(
         sniff_urls=AsyncMock(return_value=urls),
         download=download,
         discovered_titles={},
     )
-    bot.gate = SimpleNamespace()
-    bot.processor = SimpleNamespace()
-    bot.organizer = SimpleNamespace()
     bot.run_dir = tmp_path / "run"
-    bot._send_processed_files = AsyncMock()
+    bot._send_downloaded_files = AsyncMock(return_value=True)
 
-    with (
-        patch("bot.process_file", side_effect=process),
-        patch("bot.DEFAULT_WORKERS", 2),
-        patch("bot.JOB_BATCH_FILES", 200),
-        patch("bot.TELEGRAM_PROCESS_GUARD_SEC", 0.05),
+    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch(
+        "bot.JOB_BATCH_FILES", 200
     ):
         await bot.handle_url(update, None)
 
-    bot._send_processed_files.assert_awaited_once()
-    delivered = bot._send_processed_files.await_args.args[1]
-    assert sum(result["status"] == "passed" for result in delivered) == 10
-    assert sum(result["status"] == "file_timeout" for result in delivered) == 1
-    progress_messages = [call.args[0] for call in status_message.edit_text.await_args_list]
-    assert any("11/11" in text for text in progress_messages)
+    bot._send_downloaded_files.assert_awaited_once()
+    delivered_paths = bot._send_downloaded_files.await_args.args[1]
+    assert len(delivered_paths) == 11
+    assert all(path.suffix == ".mp3" for path in delivered_paths)
 
 
 @pytest.mark.asyncio
