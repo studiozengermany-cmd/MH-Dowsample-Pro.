@@ -336,7 +336,7 @@ async def test_owner_uses_local_library_delivery_by_default(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_can_retry_existing_library_without_reprocessing(tmp_path) -> None:
+async def test_approved_user_can_retry_existing_library_without_reprocessing(tmp_path) -> None:
     output_root = tmp_path / "organized"
     first = output_root / "Loops" / "first.wav"
     second = output_root / "FX" / "second.wav"
@@ -349,7 +349,7 @@ async def test_admin_can_retry_existing_library_without_reprocessing(tmp_path) -
     reply_text = AsyncMock()
     reply_document = AsyncMock()
     update = SimpleNamespace(
-        effective_user=SimpleNamespace(id=42),
+        effective_user=SimpleNamespace(id=77),
         effective_message=SimpleNamespace(
             reply_text=reply_text,
             reply_document=reply_document,
@@ -358,9 +358,9 @@ async def test_admin_can_retry_existing_library_without_reprocessing(tmp_path) -
     bot = AudioBot.__new__(AudioBot)
     bot.output_dir = output_root
     bot.run_dir = tmp_path / "run"
+    bot._has_access = lambda _update: True
 
-    with patch("bot.ADMIN_USER_ID", 42):
-        await bot.cmd_retry_delivery(update, None)
+    await bot.cmd_retry_delivery(update, None)
 
     assert "<b>2</b> sample" in reply_text.await_args_list[0].args[0]
     assert "không tải hoặc xử lý lại" in reply_text.await_args_list[0].args[0]

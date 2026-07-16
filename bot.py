@@ -812,7 +812,8 @@ class AudioBot:
         self, update: Update, _context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Re-package the current organized library without crawling or processing again."""
-        if not self._is_admin(update):
+        if not self._has_access(update):
+            await self._reply_access_gate(update)
             return
         message = update.effective_message
         if not message:
@@ -1161,6 +1162,7 @@ class AudioBot:
             BotCommand("yeucau", "Gửi yêu cầu bằng mã mời"),
             BotCommand("quyen", "Xem trạng thái quyền sử dụng"),
             BotCommand("thongke", "Xem thống kê thư viện âm thanh"),
+            BotCommand("taigoi", "Đóng gói lại thư viện hiện có"),
         ]
         admin_commands = [
             *public_commands,
@@ -1168,7 +1170,6 @@ class AudioBot:
             BotCommand("thumuc", "Xem nơi lưu âm thanh trên máy chủ"),
             BotCommand("datthumuc", "Chọn nơi lưu sample trên máy chủ"),
             BotCommand("sapxep", "Xử lý một thư mục trên máy chủ"),
-            BotCommand("taigoi", "Đóng gói lại thư viện hiện có"),
         ]
         try:
             if (await application.bot.get_my_name()).name != name:
