@@ -19,7 +19,7 @@ FROZEN_FILE_HASHES = {
     "quality_gate.py": "e69c9696685faba665bad469371060bb3797f5adb7601abe4a6f8ef8eaad5496",
     "processor.py": "58a7a2bc0405c58fc46a00ee3c2f2978c622d90ed77d415fecca015f9cad7315",
     "organizer.py": "611ae7ab0c00f60868cf3728b64a4ae2450fed4c4373af90b10f2457930f837f",
-    "organize.py": "147bb877286b6f0b2ed4ad483f58716e4131230d90436b1460ba0102f40cd34a",
+    "organize.py": "416fa4ec637324b93f7e1d876414925e4b555d77ee5a9767e9d7e2108ff69079",
 }
 FROZEN_HANDLE_URL_HASH = "1d9a6f394224b79fd0339c1ea14168a98cdc7814f3da455423cbafc095501163"
 

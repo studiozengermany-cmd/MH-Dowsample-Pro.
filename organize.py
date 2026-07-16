@@ -338,6 +338,12 @@ async def run_pipeline(
                         logging.warning("Rejected %s: %s", filepath, ", ".join(result.get("issues", [])))
                     elif status == "duplicate":
                         logging.info("Skipped %s (Duplicate)", filepath)
+                    elif status == "file_timeout":
+                        logging.error(
+                            "Timed out %s: %s",
+                            filepath,
+                            result.get("error", "Processing timed out"),
+                        )
                     else:
                         logging.info("Organized %s", filepath)
 
@@ -354,7 +360,14 @@ def _print_summary(counts: Counter[str]) -> None:
     table = Table(title="Audio Organizer v4.1")
     table.add_column("Status")
     table.add_column("Count", justify="right")
-    for status in ("passed", "would_pass", "rejected", "duplicate", "error"):
+    for status in (
+        "passed",
+        "would_pass",
+        "rejected",
+        "duplicate",
+        "file_timeout",
+        "error",
+    ):
         table.add_row(status, str(counts[status]))
     console.print(table)
 
@@ -420,7 +433,7 @@ def main() -> int:
             )
         )
         _print_summary(counts)
-        return 1 if counts["error"] else 0
+        return 1 if counts["error"] or counts["file_timeout"] else 0
     except (AudioOrganizerError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
