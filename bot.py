@@ -33,7 +33,7 @@ from telegram.ext import (
     filters,
 )
 
-from access_control import AccessControlStore, AccessStatus, RequestOutcome
+from access_control import AccessControlStore, AccessStatus, AccessUser, RequestOutcome
 from config import (
     ADMIN_USER_ID,
     AUDIO_EXTS,
@@ -275,16 +275,16 @@ def format_welcome() -> str:
 
 
 def format_admin_welcome() -> str:
-    """Explain the automatic crawl-filter-return flow."""
+    """Explain the download-first flow shown to approved users."""
     return (
         "🎧 <b>MH - DOWNSAMPLE PRO</b>\n\n"
-        "Bot hỗ trợ tìm và xử lý âm thanh từ nhiều trang khác nhau. Anh không cần chọn "
+        "Bot hỗ trợ tìm và tải âm thanh từ nhiều trang khác nhau. Anh không cần chọn "
         "trước một nền tảng cố định.\n\n"
         "<b>CÁCH SỬ DỤNG</b>\n"
-        "1. Gửi liên kết của trang hoặc tệp âm thanh cần xử lý.\n"
+        "1. Gửi liên kết của trang hoặc gói âm thanh cần tải.\n"
         "2. Bot tự tìm và tải các tệp âm thanh công khai trong liên kết.\n"
-        "3. Tệp tải về được kiểm tra chất lượng, chuẩn hóa và phân loại.\n"
-        "4. Bot gửi lại các tệp đạt chất lượng ngay trong cuộc trò chuyện này."
+        "3. Bot giữ tên file nguồn và chia ZIP dưới 20 MB.\n"
+        "4. Xong mỗi lô, bot gửi ngay rồi mới tải lô tiếp theo."
     )
 
 
@@ -295,7 +295,7 @@ def format_usage_guide() -> str:
         "Dạ, anh/chị chỉ cần thực hiện ba bước sau:\n\n"
         "1. Sao chép liên kết của trang hoặc tệp âm thanh cần xử lý.\n"
         "2. Dán liên kết vào ô tin nhắn trong cuộc trò chuyện này rồi bấm gửi.\n"
-        "3. Em sẽ tự tải, lọc chất lượng và gửi lại tệp kết quả ngay trên Telegram."
+        "3. Em sẽ giữ file gốc, chia ZIP và gửi lại ngay trên Telegram."
     )
 
 
@@ -315,6 +315,12 @@ def main_menu(*, is_admin: bool = False) -> InlineKeyboardMarkup:
                 [
                     InlineKeyboardButton("📁 Xử lý thư mục", callback_data="menu:sap_xep"),
                     InlineKeyboardButton("⚙️ Nơi lưu", callback_data="menu:cai_dat_thu_muc"),
+                ],
+                [
+                    InlineKeyboardButton("🔑 Tạo mã mời", callback_data="menu:tao_ma"),
+                    InlineKeyboardButton(
+                        "👥 Xét duyệt người dùng", callback_data="menu:xet_duyet"
+                    ),
                 ],
             ]
         )
@@ -380,6 +386,50 @@ def admin_access_keyboard(user_id: int, status: AccessStatus) -> InlineKeyboardM
             ]
         ]
     )
+
+
+def pending_access_keyboard(users: Sequence[AccessUser]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for user in users:
+        label = user.full_name or (
+            f"@{user.username}" if user.username else str(user.telegram_user_id)
+        )
+        short_label = label[:24]
+        prefix = f"access:admin:{{action}}:{user.telegram_user_id}:pending"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ {short_label}",
+                    callback_data=prefix.format(action="approve"),
+                ),
+                InlineKeyboardButton(
+                    "❌", callback_data=prefix.format(action="reject")
+                ),
+                InlineKeyboardButton(
+                    "⛔", callback_data=prefix.format(action="block")
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="menu:quay_lai")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_pending_access(users: Sequence[AccessUser]) -> str:
+    if not users:
+        return (
+            "👥 <b>XÉT DUYỆT NGƯỜI DÙNG</b>\n\n"
+            "✅ Hiện không có yêu cầu nào đang chờ duyệt."
+        )
+    lines = ["👥 <b>XÉT DUYỆT NGƯỜI DÙNG</b>", ""]
+    for index, user in enumerate(users, start=1):
+        name = html.escape(user.full_name or "Không có tên")
+        username = html.escape(f"@{user.username}" if user.username else "Không có")
+        lines.append(
+            f"{index}. <b>{name}</b> — "
+            f"<code>{user.telegram_user_id}</code> — {username}"
+        )
+    lines.append("\nBấm ✅ để duyệt, ❌ để từ chối hoặc ⛔ để chặn.")
+    return "\n".join(lines)
 
 
 class AudioBot:
@@ -569,6 +619,18 @@ class AudioBot:
                 parse_mode="HTML",
             )
 
+    async def cmd_pending_access(
+        self, update: Update, _context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not self._is_admin(update) or not update.effective_message:
+            return
+        users = self.access_control.list_users(status=AccessStatus.PENDING, limit=20)
+        await update.effective_message.reply_text(
+            format_pending_access(users),
+            parse_mode="HTML",
+            reply_markup=pending_access_keyboard(users),
+        )
+
     async def handle_access_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -715,6 +777,32 @@ class AudioBot:
                 format_stats(self.organizer.get_stats()),
                 parse_mode="HTML",
                 reply_markup=back_to_menu(),
+            )
+            return
+        if action == "tao_ma" and is_admin:
+            code = self.access_control.create_invite(
+                created_by=ADMIN_USER_ID,
+                ttl=timedelta(hours=24),
+            )
+            await self.backup_database_to_telegram(context)
+            await query.edit_message_text(
+                "🔑 <b>MÃ MỜI DÙNG MỘT LẦN</b>\n\n"
+                f"<code>{code}</code>\n\n"
+                "Hết hạn sau 24 giờ. Gửi nguyên dòng này cho người dùng:\n"
+                f"<code>/yeucau {code}</code>",
+                parse_mode="HTML",
+                reply_markup=back_to_menu(),
+            )
+            return
+        if action == "xet_duyet" and is_admin:
+            users = self.access_control.list_users(
+                status=AccessStatus.PENDING,
+                limit=20,
+            )
+            await query.edit_message_text(
+                format_pending_access(users),
+                parse_mode="HTML",
+                reply_markup=pending_access_keyboard(users),
             )
             return
         if action == "sap_xep" and is_admin:
@@ -998,14 +1086,26 @@ class AudioBot:
             output_root=raw_root,
             temp_root=self.run_dir,
             owner_mode="telegram",
-            archive_part_bytes=TELEGRAM_ARCHIVE_PART_BYTES,
-            upload_retries=TELEGRAM_UPLOAD_RETRIES,
+            archive_part_bytes=min(TELEGRAM_ARCHIVE_PART_BYTES, 10 * 1024 * 1024),
+            upload_retries=min(TELEGRAM_UPLOAD_RETRIES, 2),
             upload_timeout_sec=TELEGRAM_UPLOAD_TIMEOUT_SEC,
             archive_builder=build_original_archives,
             original_files=True,
+            upload_attempt_guard_sec=45,
         )
         report = await service.deliver(message, results, site, is_owner=False)
-        return bool(report.sent_parts) and not report.failed_parts and not report.build_failed
+        delivered = bool(report.sent_parts) and not report.failed_parts and not report.build_failed
+        if delivered:
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Không thể dọn file gốc đã gửi: %s", path)
+            try:
+                raw_root.rmdir()
+            except OSError:
+                pass
+        return delivered
 
     async def handle_url(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -1277,11 +1377,11 @@ class AudioBot:
             logger.warning("Không thể tự động khôi phục database từ Telegram: %s", e)
 
         name = "MH - Downsample Pro"
-        short_description = "Thu thập, chuẩn hóa và phân loại mẫu âm thanh dành cho người làm nhạc."
+        short_description = "Tải file âm thanh gốc, giữ tên nguồn và gửi ZIP theo từng lô."
         description = (
-            "🎧 Trợ lý xử lý mẫu âm thanh dành cho người làm nhạc Việt Nam.\n\n"
-            "Gửi một đường dẫn có âm thanh để hệ thống tìm mẫu, kiểm tra chất lượng, "
-            "chuẩn hóa, phân loại và gửi tệp kết quả ngay trên Telegram."
+            "🎧 Trợ lý tải mẫu âm thanh dành cho người làm nhạc Việt Nam.\n\n"
+            "Gửi một đường dẫn có âm thanh để hệ thống tải file gốc, giữ tên nguồn, "
+            "chia ZIP an toàn và gửi từng lô ngay trên Telegram."
         )
         public_commands = [
             BotCommand("batdau", "Mở hướng dẫn sử dụng"),
@@ -1293,6 +1393,7 @@ class AudioBot:
         admin_commands = [
             *public_commands,
             BotCommand("taoma", "Tạo mã mời dùng một lần"),
+            BotCommand("duyet", "Xem người dùng đang chờ duyệt"),
             BotCommand("thumuc", "Xem nơi lưu âm thanh trên máy chủ"),
             BotCommand("datthumuc", "Chọn nơi lưu sample trên máy chủ"),
             BotCommand("sapxep", "Xử lý một thư mục trên máy chủ"),
@@ -1382,6 +1483,7 @@ class AudioBot:
         application.add_handler(CommandHandler("yeucau", self.cmd_request_access))
         application.add_handler(CommandHandler("quyen", self.cmd_access_status))
         application.add_handler(CommandHandler("taoma", self.cmd_create_invite))
+        application.add_handler(CommandHandler("duyet", self.cmd_pending_access))
         application.add_handler(CommandHandler(["stats", "thongke"], self.cmd_authorized_stats))
         application.add_handler(CommandHandler(["path", "thumuc"], self.cmd_path))
         application.add_handler(CommandHandler("datthumuc", self.cmd_set_output))

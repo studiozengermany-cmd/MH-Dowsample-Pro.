@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import zipfile
 from pathlib import Path
@@ -178,6 +179,33 @@ async def test_network_timeout_is_retried_by_delivery_service(tmp_path: Path) ->
     assert sent is True
     assert reply_document.await_count == 2
     sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hung_telegram_upload_is_cut_off_and_retried(tmp_path: Path) -> None:
+    archive = tmp_path / "part.zip"
+    archive.write_bytes(b"zip")
+
+    async def hang(**_kwargs):
+        await asyncio.Event().wait()
+
+    reply_document = AsyncMock(side_effect=hang)
+    message = SimpleNamespace(reply_document=reply_document)
+    service = DeliveryService(
+        output_root=tmp_path / "library",
+        temp_root=tmp_path / "run",
+        owner_mode="telegram",
+        archive_part_bytes=1024,
+        upload_retries=2,
+        upload_timeout_sec=300,
+        upload_attempt_guard_sec=0.01,
+    )
+
+    with patch("delivery.asyncio.sleep", new=AsyncMock()):
+        sent = await service.send_archive_with_retry(message, archive, "caption")
+
+    assert sent is False
+    assert reply_document.await_count == 2
 
 
 @pytest.mark.asyncio

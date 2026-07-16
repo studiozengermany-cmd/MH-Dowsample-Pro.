@@ -317,6 +317,7 @@ class DeliveryService:
         upload_timeout_sec: float,
         archive_builder: ArchiveBuilder = build_result_archives,
         original_files: bool = False,
+        upload_attempt_guard_sec: float = 45.0,
     ) -> None:
         if owner_mode not in {"local", "telegram", "both"}:
             raise ValueError("owner_mode must be local, telegram, or both")
@@ -326,6 +327,8 @@ class DeliveryService:
             raise ValueError("upload_retries must be positive")
         if upload_timeout_sec < 1:
             raise ValueError("upload_timeout_sec must be positive")
+        if upload_attempt_guard_sec <= 0:
+            raise ValueError("upload_attempt_guard_sec must be positive")
         self.output_root = output_root
         self.temp_root = temp_root
         self.owner_mode = owner_mode
@@ -334,6 +337,7 @@ class DeliveryService:
         self.upload_timeout_sec = upload_timeout_sec
         self.archive_builder = archive_builder
         self.original_files = original_files
+        self.upload_attempt_guard_sec = upload_attempt_guard_sec
 
     async def send_archive_with_retry(
         self,
@@ -345,15 +349,18 @@ class DeliveryService:
             delay = 0.0
             try:
                 with archive_path.open("rb") as bundle:
-                    await message.reply_document(
-                        document=bundle,
-                        filename=archive_path.name,
-                        caption=caption,
-                        parse_mode="HTML",
-                        read_timeout=self.upload_timeout_sec,
-                        write_timeout=self.upload_timeout_sec,
-                        connect_timeout=30,
-                        pool_timeout=30,
+                    await asyncio.wait_for(
+                        message.reply_document(
+                            document=bundle,
+                            filename=archive_path.name,
+                            caption=caption,
+                            parse_mode="HTML",
+                            read_timeout=self.upload_timeout_sec,
+                            write_timeout=self.upload_timeout_sec,
+                            connect_timeout=30,
+                            pool_timeout=30,
+                        ),
+                        timeout=self.upload_attempt_guard_sec,
                     )
                 return True
             except RetryAfter as exc:
@@ -377,6 +384,15 @@ class DeliveryService:
                     attempt,
                     self.upload_retries,
                     exc,
+                )
+            except TimeoutError:
+                delay = min(2 ** (attempt - 1), 15)
+                logger.warning(
+                    "Dừng lần gửi %s bị treo sau %.0f giây (%d/%d)",
+                    archive_path.name,
+                    self.upload_attempt_guard_sec,
+                    attempt,
+                    self.upload_retries,
                 )
             except TelegramError as exc:
                 logger.error("Telegram từ chối gói %s: %s", archive_path.name, exc)

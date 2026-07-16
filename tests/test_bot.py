@@ -2,7 +2,7 @@ import asyncio
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from telegram.error import TelegramError, TimedOut
@@ -133,7 +133,8 @@ def test_public_welcome_is_clear_and_does_not_expose_host_tools() -> None:
     assert "MH - DOWNSAMPLE PRO" in message
     assert "<b>CÁCH SỬ DỤNG</b>" in message
     assert "Bot tự tìm và tải" in message
-    assert "kiểm tra chất lượng" in message
+    assert "giữ tên file nguồn" in message
+    assert "ZIP dưới 20 MB" in message
     assert "đăng nhập" not in message.lower()
     assert "/batdau" not in message
     assert "/thumuc" not in message
@@ -146,7 +147,7 @@ def test_usage_guide_explains_one_linear_journey() -> None:
     assert "Dạ, anh/chị" in message
     assert "Sao chép liên kết" in message
     assert "Dán liên kết" in message
-    assert "gửi lại tệp kết quả" in message
+    assert "giữ file gốc" in message
     assert "TRỢ LÝ SẼ TỰ ĐỘNG" not in message
 
 
@@ -157,6 +158,9 @@ def test_admin_actions_are_buttons_not_welcome_text() -> None:
     assert "📁 Xử lý thư mục" not in public_labels
     assert admin_labels[0] == "🔗 Gửi liên kết âm thanh"
     assert "📁 Xử lý thư mục" in admin_labels
+    assert "🔑 Tạo mã mời" in admin_labels
+    assert "👥 Xét duyệt người dùng" in admin_labels
+    assert "🔑 Tạo mã mời" not in public_labels
     assert all("Đăng nhập" not in label for label in public_labels + admin_labels)
 
 
@@ -166,9 +170,35 @@ def test_admin_welcome_explains_the_automatic_pipeline() -> None:
     assert "nhiều trang khác nhau" in message
     assert "không cần chọn trước một nền tảng cố định" in message
     assert "Bot tự tìm và tải" in message
-    assert "chuẩn hóa và phân loại" in message
+    assert "giữ tên file nguồn" in message
+    assert "gửi ngay rồi mới tải lô tiếp theo" in message
     assert "đăng nhập" not in message.lower()
     assert "Splice" not in message
+
+
+@pytest.mark.asyncio
+async def test_admin_invite_button_creates_code_and_shows_share_command() -> None:
+    query = SimpleNamespace(
+        data="menu:tao_ma",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=999),
+        callback_query=query,
+    )
+    bot = AudioBot.__new__(AudioBot)
+    bot.access_control = SimpleNamespace(create_invite=Mock(return_value="ABCD-1234"))
+    bot.backup_database_to_telegram = AsyncMock()
+    context = SimpleNamespace(bot=SimpleNamespace())
+
+    with patch("bot.ADMIN_USER_ID", 999):
+        await bot.handle_menu(update, context)
+
+    response = query.edit_message_text.await_args.args[0]
+    assert "ABCD-1234" in response
+    assert "/yeucau ABCD-1234" in response
+    bot.backup_database_to_telegram.assert_awaited_once_with(context)
 
 
 @pytest.mark.asyncio
@@ -270,9 +300,7 @@ async def test_empty_discovery_fallback_message_has_no_login_button() -> None:
         ),
     )
     bot = AudioBot.__new__(AudioBot)
-    bot.crawler = SimpleNamespace(
-        sniff_urls=AsyncMock(side_effect=NoAudioFoundError("no public audio"))
-    )
+    bot.crawler = SimpleNamespace(sniff_urls=AsyncMock(side_effect=NoAudioFoundError("no public audio")))
 
     await bot.handle_url(update, None)
 
@@ -307,17 +335,13 @@ async def test_download_batches_send_original_files_immediately(tmp_path) -> Non
     bot.run_dir = tmp_path / "run"
     bot._send_downloaded_files = AsyncMock(return_value=True)
 
-    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch(
-        "bot.JOB_BATCH_FILES", 2
-    ):
+    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch("bot.JOB_BATCH_FILES", 2):
         await bot.handle_url(update, None)
 
     progress_messages = [call.args[0] for call in status_message.edit_text.await_args_list]
     assert any("Đang đóng gói và gửi" in text for text in progress_messages)
     assert bot._send_downloaded_files.await_count == 3
-    assert [
-        len(call.args[1]) for call in bot._send_downloaded_files.await_args_list
-    ] == [2, 2, 2]
+    assert [len(call.args[1]) for call in bot._send_downloaded_files.await_args_list] == [2, 2, 2]
 
 
 @pytest.mark.asyncio
@@ -346,9 +370,7 @@ async def test_url_delivery_never_calls_audio_processing(tmp_path) -> None:
     bot.run_dir = tmp_path / "run"
     bot._send_downloaded_files = AsyncMock(return_value=True)
 
-    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch(
-        "bot.JOB_BATCH_FILES", 200
-    ):
+    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch("bot.JOB_BATCH_FILES", 200):
         await bot.handle_url(update, None)
 
     bot._send_downloaded_files.assert_awaited_once()
@@ -370,16 +392,14 @@ async def test_processed_file_is_returned_through_telegram(tmp_path) -> None:
         effective_message=SimpleNamespace(
             reply_text=reply_text,
             reply_document=reply_document,
-        )
+        ),
     )
     bot = AudioBot.__new__(AudioBot)
     bot.run_dir = tmp_path / "run"
     bot.output_dir = output_root
     bot.delivery_retry_store = DeliveryRetryStore(tmp_path / "delivery-retries.db")
 
-    await bot._send_processed_files(
-        update, [{"status": "passed", "output": str(output)}], "loopcloud.com"
-    )
+    await bot._send_processed_files(update, [{"status": "passed", "output": str(output)}], "loopcloud.com")
 
     reply_document.assert_awaited_once()
     assert reply_document.await_args.kwargs["filename"] == "loopcloud.com-samples.zip"
@@ -391,9 +411,7 @@ async def test_processed_file_is_returned_through_telegram(tmp_path) -> None:
     retry_record = bot.delivery_retry_store.load(-1, output_root)
     assert retry_record is not None
     assert retry_record.site == "loopcloud.com"
-    assert retry_record.results == (
-        {"status": "passed", "output": str(output.resolve())},
-    )
+    assert retry_record.results == ({"status": "passed", "output": str(output.resolve())},)
 
 
 @pytest.mark.asyncio
@@ -412,9 +430,7 @@ async def test_owner_uses_local_library_delivery_by_default(tmp_path) -> None:
     bot.run_dir = tmp_path / "run"
 
     with patch("bot.ADMIN_USER_ID", 42), patch("bot.OWNER_DELIVERY_MODE", "local"):
-        await bot._send_processed_files(
-            update, [{"status": "passed", "output": str(output)}], "splice.com"
-        )
+        await bot._send_processed_files(update, [{"status": "passed", "output": str(output)}], "splice.com")
 
     assert "ĐÃ LƯU KẾT QUẢ TRÊN MÁY" in reply_text.await_args.args[0]
     assert str(bot.output_dir) in reply_text.await_args.args[0]
@@ -482,9 +498,7 @@ async def test_admin_can_assign_pre_manifest_library_to_one_approved_customer(
     bot = AudioBot.__new__(AudioBot)
     bot.output_dir = output_root
     bot.access_control = SimpleNamespace(
-        status_for=lambda user_id: AccessStatus.APPROVED
-        if user_id == 77
-        else AccessStatus.PENDING
+        status_for=lambda user_id: AccessStatus.APPROVED if user_id == 77 else AccessStatus.PENDING
     )
     bot.delivery_retry_store = DeliveryRetryStore(tmp_path / "delivery-retries.db")
 
@@ -494,9 +508,7 @@ async def test_admin_can_assign_pre_manifest_library_to_one_approved_customer(
     record = bot.delivery_retry_store.load(77, output_root)
     assert record is not None
     assert record.site == "library-recovery"
-    assert record.results == (
-        {"status": "passed", "output": str(sample.resolve())},
-    )
+    assert record.results == ({"status": "passed", "output": str(sample.resolve())},)
     assert "ĐÃ GÁN JOB CŨ CHO KHÁCH" in update.effective_message.reply_text.await_args.args[0]
 
 

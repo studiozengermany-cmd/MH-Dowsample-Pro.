@@ -243,6 +243,37 @@ class AccessControlStore:
             decided_by=int(row["decided_by"]) if row["decided_by"] is not None else None,
         )
 
+    def list_users(
+        self,
+        *,
+        status: AccessStatus | None = None,
+        limit: int = 20,
+    ) -> list[AccessUser]:
+        """Return recent access records for the administrator review screen."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        query = "SELECT * FROM access_users"
+        parameters: tuple[object, ...] = ()
+        if status is not None:
+            query += " WHERE status=?"
+            parameters = (status.value,)
+        query += " ORDER BY requested_at ASC LIMIT ?"
+        parameters = (*parameters, limit)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            AccessUser(
+                telegram_user_id=int(row["telegram_user_id"]),
+                username=str(row["username"]) if row["username"] is not None else None,
+                full_name=str(row["full_name"]) if row["full_name"] is not None else None,
+                status=AccessStatus(str(row["status"])),
+                requested_at=datetime.fromisoformat(str(row["requested_at"])),
+                updated_at=datetime.fromisoformat(str(row["updated_at"])),
+                decided_by=(int(row["decided_by"]) if row["decided_by"] is not None else None),
+            )
+            for row in rows
+        ]
+
     def status_for(self, telegram_user_id: int) -> AccessStatus | None:
         user = self.get_user(telegram_user_id)
         return user.status if user else None
