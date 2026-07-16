@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import html
 import logging
 import os
@@ -10,7 +11,7 @@ import re
 import tempfile
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -144,6 +145,52 @@ def cleanup_archives(paths: Sequence[Path]) -> None:
             path.unlink(missing_ok=True)
         except OSError:
             logger.warning("Không thể dọn gói delivery tạm %s", path, exc_info=True)
+
+
+def _partition_readable_paths(
+    paths: Sequence[Path], max_part_bytes: int
+) -> tuple[list[list[Path]], list[Path]]:
+    """Make small delivery batches and isolate paths that vanished before packaging."""
+    batches: list[list[Path]] = []
+    unavailable: list[Path] = []
+    current: list[Path] = []
+    current_bytes = 0
+
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            logger.warning(
+                "File kết quả không còn đọc được trước khi đóng gói: %s", path
+            )
+            unavailable.append(path)
+            continue
+
+        if current and current_bytes + size > max_part_bytes:
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(path)
+        current_bytes += size
+
+    if current:
+        batches.append(current)
+    return batches, unavailable
+
+
+def _mark_paths_unavailable(
+    manifest: DeliveryManifest, paths: Sequence[Path]
+) -> DeliveryManifest:
+    unavailable = set(paths)
+    if not unavailable:
+        return manifest
+    remaining = tuple(item for item in manifest.items if item.path not in unavailable)
+    removed = len(manifest.items) - len(remaining)
+    return replace(
+        manifest,
+        items=remaining,
+        unavailable_count=manifest.unavailable_count + removed,
+    )
 
 
 def build_result_archives(
@@ -314,6 +361,10 @@ class DeliveryService:
         is_owner: bool,
     ) -> DeliveryReport:
         manifest = build_delivery_manifest(results)
+        batches, unavailable_paths = _partition_readable_paths(
+            manifest.paths, self.archive_part_bytes
+        )
+        manifest = _mark_paths_unavailable(manifest, unavailable_paths)
         if not manifest.paths:
             await message.reply_text(
                 "⚠️ <b>KHÔNG CÓ FILE ĐỦ ĐIỀU KIỆN GIAO</b>\n\n"
@@ -324,7 +375,13 @@ class DeliveryService:
 
         local_notified = False
         if is_owner and self.owner_mode in {"local", "both"}:
-            total_mb = sum(path.stat().st_size for path in manifest.paths) / (1024 * 1024)
+            total_bytes = 0
+            for path in manifest.paths:
+                try:
+                    total_bytes += path.stat().st_size
+                except OSError:
+                    logger.warning("Không thể tính dung lượng file kết quả %s", path)
+            total_mb = total_bytes / (1024 * 1024)
             await message.reply_text(
                 "📁 <b>ĐÃ LƯU KẾT QUẢ TRÊN MÁY</b>\n\n"
                 + "\n".join(_status_lines(manifest))
@@ -338,61 +395,126 @@ class DeliveryService:
             if self.owner_mode == "local":
                 return DeliveryReport(manifest=manifest, local_notified=True)
 
-        archive_paths: list[Path] = []
+        archive_count = 0
         sent_parts: list[int] = []
         failed_parts: list[int] = []
-        try:
-            archive_paths = await asyncio.get_running_loop().run_in_executor(
-                None,
-                partial(
-                    self.archive_builder,
-                    manifest.paths,
-                    self.output_root,
-                    self.temp_root,
-                    _safe_archive_stem(site),
-                    self.archive_part_bytes,
-                ),
-            )
-            for index, archive_path in enumerate(archive_paths, start=1):
-                part = "" if len(archive_paths) == 1 else f" — gói <b>{index}/{len(archive_paths)}</b>"
-                caption = (
-                    f"✅ <b>Đã gom gọn {manifest.ready_count} sample</b>{part}\n"
-                    + "\n".join(_status_lines(manifest))
-                    + "\nCác file trong gói giữ nguyên thư mục phân loại."
+        failed_build_paths: list[Path] = []
+        fatal_build_error: OSError | None = None
+        build_attempt = 0
+        archive_stem = _safe_archive_stem(site)
+
+        async def build_and_send(batch: Sequence[Path]) -> bool:
+            """Return false only for a fatal storage error that should stop this delivery."""
+            nonlocal archive_count, build_attempt, fatal_build_error
+            build_attempt += 1
+            batch_stem = f"{archive_stem}-batch-{build_attempt:03d}"
+            archive_paths: list[Path] = []
+            try:
+                archive_paths = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    partial(
+                        self.archive_builder,
+                        batch,
+                        self.output_root,
+                        self.temp_root,
+                        batch_stem,
+                        self.archive_part_bytes,
+                    ),
                 )
-                if await self.send_archive_with_retry(message, archive_path, caption):
-                    sent_parts.append(index)
-                else:
-                    failed_parts.append(index)
-            if failed_parts:
-                failed_text = ", ".join(str(part_number) for part_number in failed_parts)
-                await message.reply_text(
-                    "⚠️ <b>Telegram chưa nhận được một số gói</b>\n\n"
-                    f"Các gói chưa gửi được: <b>{failed_text}</b>. "
-                    f"Bot đã thử lại {self.upload_retries} lần cho mỗi gói. "
-                    "Kết quả xử lý vẫn được giữ an toàn trên máy chủ.",
-                    parse_mode="HTML",
+                if not archive_paths:
+                    raise RuntimeError("archive builder returned no files")
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    fatal_build_error = exc
+                    logger.exception("Ổ đĩa tạm hết chỗ khi tạo gói kết quả")
+                    return False
+                if len(batch) > 1:
+                    middle = len(batch) // 2
+                    return await build_and_send(batch[:middle]) and await build_and_send(
+                        batch[middle:]
+                    )
+                logger.exception("Không thể đóng gói file kết quả %s", batch[0])
+                failed_build_paths.append(batch[0])
+                return True
+            except Exception:
+                if len(batch) > 1:
+                    middle = len(batch) // 2
+                    return await build_and_send(batch[:middle]) and await build_and_send(
+                        batch[middle:]
+                    )
+                logger.exception("Không thể đóng gói file kết quả %s", batch[0])
+                failed_build_paths.append(batch[0])
+                return True
+
+            try:
+                for archive_path in archive_paths:
+                    archive_count += 1
+                    part_number = archive_count
+                    caption = (
+                        f"✅ <b>Gói sample đã sẵn sàng</b> — gói <b>{part_number}</b>\n"
+                        + "\n".join(_status_lines(manifest))
+                        + "\nCác file trong gói giữ nguyên thư mục phân loại."
+                    )
+                    try:
+                        sent = await self.send_archive_with_retry(
+                            message, archive_path, caption
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Lỗi ngoài dự kiến khi gửi gói %s", archive_path
+                        )
+                        sent = False
+                    if sent:
+                        sent_parts.append(part_number)
+                    else:
+                        failed_parts.append(part_number)
+                    # Free each ZIP before building the next batch. The organized
+                    # library file is never touched by this cleanup.
+                    cleanup_archives([archive_path])
+                return True
+            finally:
+                cleanup_archives(archive_paths)
+
+        for batch in batches:
+            if not await build_and_send(batch):
+                break
+
+        manifest = _mark_paths_unavailable(manifest, failed_build_paths)
+        build_failed = bool(failed_build_paths or fatal_build_error)
+        if build_failed:
+            if fatal_build_error:
+                detail = (
+                    "Ổ đĩa tạm không còn đủ chỗ để tạo gói tiếp theo. "
+                    "Các ZIP tạm đã được dọn; file kết quả gốc vẫn được "
+                    "giữ."
                 )
-        except Exception:
-            logger.exception("Không thể tạo gói kết quả")
+            else:
+                detail = (
+                    f"Có <b>{len(failed_build_paths)}</b> file không đọc hoặc "
+                    "đóng gói được. Bot đã bỏ qua đúng các file đó và vẫn "
+                    "gửi những gói còn lại. "
+                    "Kết quả đã xử lý vẫn được giữ trên máy chủ."
+                )
             await message.reply_text(
-                "⚠️ <b>Chưa tạo được gói sample</b>\n\n"
-                "Không thể đọc hoặc đóng gói một số file. "
-                "Kết quả đã xử lý vẫn được giữ trên máy chủ.",
+                "⚠️ <b>Một phần kết quả chưa đóng gói được</b>\n\n" + detail,
                 parse_mode="HTML",
             )
-            return DeliveryReport(
-                manifest=manifest,
-                local_notified=local_notified,
-                build_failed=True,
+
+        if failed_parts:
+            failed_text = ", ".join(str(part_number) for part_number in failed_parts)
+            await message.reply_text(
+                "⚠️ <b>Telegram chưa nhận được một số gói</b>\n\n"
+                f"Các gói chưa gửi được: <b>{failed_text}</b>. "
+                f"Bot đã thử lại {self.upload_retries} lần cho mỗi gói. "
+                "Kết quả xử lý vẫn được giữ an toàn trên máy chủ.",
+                parse_mode="HTML",
             )
-        finally:
-            cleanup_archives(archive_paths)
 
         return DeliveryReport(
             manifest=manifest,
             local_notified=local_notified,
-            archive_count=len(archive_paths),
+            archive_count=archive_count,
             sent_parts=tuple(sent_parts),
             failed_parts=tuple(failed_parts),
+            build_failed=build_failed,
         )

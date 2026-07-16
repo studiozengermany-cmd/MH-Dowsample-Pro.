@@ -209,6 +209,97 @@ async def test_partial_upload_continues_and_cleans_every_temporary_zip(tmp_path:
         assert hashlib.sha256(path.read_bytes()).hexdigest() == before_hash
 
 
+@pytest.mark.asyncio
+async def test_one_unreadable_file_isolated_without_blocking_other_results(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "library"
+    readable = output_root / "Loops" / "readable.wav"
+    unreadable = output_root / "FX" / "unreadable.wav"
+    readable.parent.mkdir(parents=True)
+    unreadable.parent.mkdir(parents=True)
+    readable.write_bytes(b"RIFF-readable")
+    unreadable.write_bytes(b"RIFF-unreadable")
+    real_builder = build_result_archives
+
+    def fail_only_unreadable(paths, root, archive_dir, stem, max_part_bytes):
+        if unreadable in paths:
+            raise OSError("cannot read one output")
+        return real_builder(paths, root, archive_dir, stem, max_part_bytes)
+
+    message = SimpleNamespace(reply_document=AsyncMock(), reply_text=AsyncMock())
+    service = _service(
+        tmp_path,
+        max_part_bytes=1024,
+        archive_builder=fail_only_unreadable,
+    )
+
+    report = await service.deliver(
+        message,
+        [
+            {"status": "passed", "output": str(readable)},
+            {"status": "passed", "output": str(unreadable)},
+        ],
+        "splice.com",
+        is_owner=False,
+    )
+
+    assert report.archive_count == 1
+    assert report.sent_parts == (1,)
+    assert report.build_failed is True
+    assert report.manifest.ready_count == 1
+    assert report.manifest.unavailable_count == 1
+    assert message.reply_document.await_count == 1
+    assert "<b>1</b> file" in message.reply_text.await_args.args[0]
+    assert readable.read_bytes() == b"RIFF-readable"
+    assert unreadable.read_bytes() == b"RIFF-unreadable"
+    assert not list((tmp_path / "run").glob("*.zip"))
+
+
+@pytest.mark.asyncio
+async def test_each_batch_zip_is_removed_before_the_next_batch_is_built(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "library"
+    first = output_root / "first.wav"
+    second = output_root / "second.wav"
+    output_root.mkdir(parents=True)
+    first.write_bytes(b"1234")
+    second.write_bytes(b"5678")
+    calls = 0
+
+    def one_zip_builder(paths, root, archive_dir, stem, max_part_bytes):
+        nonlocal calls
+        calls += 1
+        assert not list(archive_dir.glob("*.zip"))
+        archive = archive_dir / f"{stem}.zip"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(paths[0].read_bytes())
+        return [archive]
+
+    message = SimpleNamespace(reply_document=AsyncMock(), reply_text=AsyncMock())
+    service = _service(
+        tmp_path,
+        max_part_bytes=4,
+        archive_builder=one_zip_builder,
+    )
+
+    report = await service.deliver(
+        message,
+        [
+            {"status": "passed", "output": str(first)},
+            {"status": "passed", "output": str(second)},
+        ],
+        "splice.com",
+        is_owner=False,
+    )
+
+    assert calls == 2
+    assert report.archive_count == 2
+    assert report.sent_parts == (1, 2)
+    assert not list((tmp_path / "run").glob("*.zip"))
+
+
 def test_single_file_larger_than_final_zip_limit_fails_cleanly(tmp_path: Path) -> None:
     output_root = tmp_path / "library"
     sample = output_root / "sample.wav"
