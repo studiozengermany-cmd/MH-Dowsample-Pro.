@@ -127,7 +127,9 @@ class QualityGate:
                     "-of", "default=noprint_wrappers=1:nokey=1",
                     str(filepath),
                 ]
-                completed_dur = subprocess.run(cmd_dur, check=True, capture_output=True, text=True, timeout=10)
+                completed_dur = subprocess.run(
+                    cmd_dur, check=True, capture_output=True, text=True, timeout=10
+                )
                 dur_str = completed_dur.stdout.strip()
                 if dur_str and dur_str != "N/A":
                     duration = float(dur_str)
@@ -268,7 +270,7 @@ class QualityGate:
                 str(temp_wav)
             ]
             # Use a 30s timeout to prevent hanging forever
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=30)
 
             data, sr = sf.read(str(temp_wav), dtype="float32", always_2d=True)
             y = data.T
@@ -276,7 +278,9 @@ class QualityGate:
                 y = y[0]
             return y, sr
         except Exception as exc:
-            raise AudioAnalysisError(f"Failed to load audio file {path} using both soundfile and ffmpeg: {exc}") from exc
+            raise AudioAnalysisError(
+                f"Failed to load audio file {path} using both soundfile and ffmpeg: {exc}"
+            ) from exc
         finally:
             if temp_wav and temp_wav.exists():
                 try:

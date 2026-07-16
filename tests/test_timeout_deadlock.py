@@ -1,10 +1,10 @@
 import asyncio
-import os
-import sys
 import multiprocessing
+import os
 from pathlib import Path
 
 from organize import run_pipeline
+
 
 def test_worker_timeout_and_batch_continues(tmp_path):
     input_dir = tmp_path / "input"

@@ -67,10 +67,12 @@ def iter_audio_files(root: Path, output: Path) -> Iterator[Path]:
 
 
 
-def _worker_process_file(path: Path, site: str, staging_dir: Path, dry_run: bool, conn: multiprocessing.connection.Connection) -> None:
+def _worker_process_file(
+    path: Path, site: str, staging_dir: Path, dry_run: bool, conn: multiprocessing.connection.Connection
+) -> None:
     try:
-        from quality_gate import QualityGate
         from processor import AudioProcessor
+        from quality_gate import QualityGate
         
         gate = QualityGate()
         processor = AudioProcessor()
@@ -110,7 +112,9 @@ def _kill_process_tree(pid: int) -> None:
         except OSError:
             pass
 
-def _sync_process_file(path, site, gate, processor, organizer, staging_dir, dry_run, delete_source, ephemeral):
+def _sync_process_file(
+    path, site, gate, processor, organizer, staging_dir, dry_run, delete_source, ephemeral
+):
     try:
         source_hash = organizer.hash_file(path)
         if organizer.is_duplicate(source_hash):
@@ -170,8 +174,13 @@ def process_file(
     timeout: int = 45,
 ) -> dict[str, Any]:
     # Support mocked gate/processor in tests (they cannot be pickled)
-    if "PYTEST_CURRENT_TEST" in os.environ and "test_timeout_deadlock" not in os.environ.get("PYTEST_CURRENT_TEST", ""):
-        return _sync_process_file(path, site, gate, processor, organizer, staging_dir, dry_run, delete_source, ephemeral)
+    if (
+        "PYTEST_CURRENT_TEST" in os.environ
+        and "test_timeout_deadlock" not in os.environ.get("PYTEST_CURRENT_TEST", "")
+    ):
+        return _sync_process_file(
+            path, site, gate, processor, organizer, staging_dir, dry_run, delete_source, ephemeral
+        )
 
     try:
         source_hash = organizer.hash_file(path)
@@ -249,7 +258,11 @@ def process_file(
                 }
 
         parent_conn.close()
-        return {"status": "error", "file": str(path), "error": f"Worker process crashed (exit code {p.exitcode})"}
+        return {
+            "status": "error",
+            "file": str(path),
+            "error": f"Worker process crashed (exit code {p.exitcode})"
+        }
 
     except DuplicateFileError:
         return {"status": "duplicate", "file": str(path)}
