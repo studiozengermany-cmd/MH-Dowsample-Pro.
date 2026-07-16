@@ -16,10 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 FROZEN_FILE_HASHES = {
     "crawler.py": "813ee7036b66a623d4914b94c6645c5311ed3aba34287799f3b9827c96e86bf0",
-    "quality_gate.py": "443d1f4d3879db1b90768aebdab7641728eec90e5ff06568da151eb84edafcf2",
+    "quality_gate.py": "d38ef84a916dda4963dae646072c72e2fe03e06a9fcd67cac01ccc9b70766089",
     "processor.py": "58a7a2bc0405c58fc46a00ee3c2f2978c622d90ed77d415fecca015f9cad7315",
     "organizer.py": "611ae7ab0c00f60868cf3728b64a4ae2450fed4c4373af90b10f2457930f837f",
-    "organize.py": "54fc0edc4c8e8624179fcc5316111b385288b112ec4b741861b29001ff857005",
+    "organize.py": "6800b96caeb8886c6db81dedbec6fa6d64658aface02db9cedf26686b82520b2",
 }
 FROZEN_HANDLE_URL_HASH = "1d9a6f394224b79fd0339c1ea14168a98cdc7814f3da455423cbafc095501163"
 

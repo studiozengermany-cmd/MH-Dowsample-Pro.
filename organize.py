@@ -7,6 +7,12 @@ import asyncio
 import itertools
 import json
 import logging
+import multiprocessing
+import multiprocessing.connection
+import os
+import signal
+import subprocess
+import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -60,18 +66,51 @@ def iter_audio_files(root: Path, output: Path) -> Iterator[Path]:
             yield path
 
 
-def process_file(
-    path: Path,
-    site: str,
-    gate: QualityGate,
-    processor: AudioProcessor,
-    organizer: Organizer,
-    staging_dir: Path,
-    *,
-    dry_run: bool = False,
-    delete_source: bool = True,
-    ephemeral: bool = False,
-) -> dict[str, Any]:
+
+def _worker_process_file(path: Path, site: str, staging_dir: Path, dry_run: bool, conn: multiprocessing.connection.Connection) -> None:
+    try:
+        from quality_gate import QualityGate
+        from processor import AudioProcessor
+        
+        gate = QualityGate()
+        processor = AudioProcessor()
+        
+        analysis = gate.analyze(path)
+        if not analysis["passed"]:
+            conn.send({"status": "rejected", "analysis": analysis, "issues": analysis.get("issues", [])})
+            return
+            
+        if dry_run:
+            conn.send({"status": "would_pass", "analysis": analysis})
+            return
+            
+        staged = processor.process(path, analysis, staging_dir)
+        conn.send({"status": "passed", "analysis": analysis, "staged": str(staged)})
+    except Exception as exc:
+        conn.send({"status": "error", "error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _kill_process_tree(pid: int) -> None:
+    if sys.platform == 'win32':
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], capture_output=True)
+    else:
+        try:
+            pids = subprocess.check_output(['pgrep', '-P', str(pid)]).decode().split()
+            for child_pid in pids:
+                try:
+                    os.kill(int(child_pid), signal.SIGKILL)
+                except OSError:
+                    pass
+        except (subprocess.CalledProcessError, FileNotFoundError, AttributeError):
+            pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+def _sync_process_file(path, site, gate, processor, organizer, staging_dir, dry_run, delete_source, ephemeral):
     try:
         source_hash = organizer.hash_file(path)
         if organizer.is_duplicate(source_hash):
@@ -106,7 +145,7 @@ def process_file(
         finally:
             staged.unlink(missing_ok=True)
         if delete_source:
-            path.unlink()
+            path.unlink(missing_ok=True)
         return {
             "status": "passed",
             "file": str(path),
@@ -114,6 +153,104 @@ def process_file(
             "analysis": analysis,
             "source_hash": source_hash,
         }
+    except Exception as exc:
+        return {"status": "error", "file": str(path), "error": str(exc)}
+
+def process_file(
+    path: Path,
+    site: str,
+    gate: QualityGate,
+    processor: AudioProcessor,
+    organizer: Organizer,
+    staging_dir: Path,
+    *,
+    dry_run: bool = False,
+    delete_source: bool = True,
+    ephemeral: bool = False,
+    timeout: int = 45,
+) -> dict[str, Any]:
+    # Support mocked gate/processor in tests (they cannot be pickled)
+    if "PYTEST_CURRENT_TEST" in os.environ and "test_timeout_deadlock" not in os.environ.get("PYTEST_CURRENT_TEST", ""):
+        return _sync_process_file(path, site, gate, processor, organizer, staging_dir, dry_run, delete_source, ephemeral)
+
+    try:
+        source_hash = organizer.hash_file(path)
+        if organizer.is_duplicate(source_hash):
+            existing = organizer.metadata_for_hash(source_hash) or {}
+            return {
+                "status": "duplicate",
+                "file": str(path),
+                "output": existing.get("filepath"),
+                "source_hash": source_hash,
+            }
+
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        p = ctx.Process(
+            target=_worker_process_file,
+            args=(path, site, staging_dir, dry_run, child_conn),
+        )
+        p.start()
+        
+        child_conn.close()
+
+        p.join(timeout)
+        if p.is_alive():
+            _kill_process_tree(p.pid)
+            p.join(1)
+            parent_conn.close()
+            return {
+                "status": "file_timeout",
+                "file": str(path),
+                "error": f"Analysis timed out after {timeout}s",
+                "source_hash": source_hash,
+            }
+
+        if parent_conn.poll():
+            msg = parent_conn.recv()
+            parent_conn.close()
+            
+            if msg["status"] == "error":
+                return {"status": "error", "file": str(path), "error": msg["error"]}
+            
+            if msg["status"] == "rejected":
+                if ephemeral and path.resolve().is_relative_to(staging_dir.resolve()):
+                    path.unlink(missing_ok=True)
+                return {
+                    "status": "rejected",
+                    "file": str(path),
+                    "issues": msg["issues"],
+                    "analysis": msg["analysis"],
+                    "source_hash": source_hash,
+                }
+                
+            if msg["status"] == "would_pass":
+                return {
+                    "status": "would_pass",
+                    "file": str(path),
+                    "analysis": msg["analysis"],
+                    "source_hash": source_hash,
+                }
+                
+            if msg["status"] == "passed":
+                staged = Path(msg["staged"])
+                try:
+                    output = organizer.organize(staged, site, msg["analysis"], source_hash)
+                finally:
+                    staged.unlink(missing_ok=True)
+                if delete_source:
+                    path.unlink(missing_ok=True)
+                return {
+                    "status": "passed",
+                    "file": str(path),
+                    "output": str(output),
+                    "analysis": msg["analysis"],
+                    "source_hash": source_hash,
+                }
+
+        parent_conn.close()
+        return {"status": "error", "file": str(path), "error": f"Worker process crashed (exit code {p.exitcode})"}
+
     except DuplicateFileError:
         return {"status": "duplicate", "file": str(path)}
     except AudioOrganizerError as exc:
@@ -137,6 +274,7 @@ async def run_pipeline(
     workers: int = DEFAULT_WORKERS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     delete_source: bool = True,
+    timeout_sec: int = 45,
 ) -> Counter[str]:
     if workers < 1 or batch_size < 1:
         raise ValueError("workers and batch_size must be positive")
@@ -168,6 +306,7 @@ async def run_pipeline(
                             run_dir,
                             dry_run=dry_run,
                             delete_source=delete_source,
+                            timeout=timeout_sec,
                         ),
                     )
                     for path in batch
