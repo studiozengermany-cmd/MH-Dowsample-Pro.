@@ -1017,8 +1017,9 @@ class AudioBot:
         if not self._has_access(update):
             message = update.effective_message
             user = update.effective_user
-            if message and getattr(message, "text", None) and user:
-                text = message.text.strip()
+            message_text = getattr(message, "text", None)
+            if message and user and isinstance(message_text, str) and message_text:
+                text = message_text.strip()
                 # Tự động nhận diện nếu tin nhắn gửi lên là mã mời
                 try:
                     outcome = self.access_control.submit_request(

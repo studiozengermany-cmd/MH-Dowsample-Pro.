@@ -205,7 +205,10 @@ def process_file(
 
         p.join(timeout)
         if p.is_alive():
-            _kill_process_tree(p.pid)
+            pid = p.pid
+            if pid is None:
+                raise RuntimeError("Worker process started without a PID")
+            _kill_process_tree(pid)
             p.join(1)
             parent_conn.close()
             return {
