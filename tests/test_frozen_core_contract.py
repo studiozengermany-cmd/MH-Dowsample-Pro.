@@ -21,7 +21,7 @@ FROZEN_FILE_HASHES = {
     "organizer.py": "611ae7ab0c00f60868cf3728b64a4ae2450fed4c4373af90b10f2457930f837f",
     "organize.py": "416fa4ec637324b93f7e1d876414925e4b555d77ee5a9767e9d7e2108ff69079",
 }
-FROZEN_HANDLE_URL_HASH = "1d9a6f394224b79fd0339c1ea14168a98cdc7814f3da455423cbafc095501163"
+FROZEN_HANDLE_URL_HASH = "31e1a0a1ddb31d74b0ed553124cf3d66fe64c9743b0e29f97999ebecc9bbe82e"
 
 
 def _normalized_hash(text: str) -> str:
@@ -178,11 +178,20 @@ async def test_handle_url_hands_completed_results_to_delivery_once(tmp_path: Pat
         await instance.handle_url(update, None)
 
     expected = {**core_result, "raw": str(archived_raw)}
-    instance._send_processed_files.assert_awaited_once_with(update, [expected], "example.test")
+    instance._send_processed_files.assert_awaited_once_with(
+        update,
+        [expected],
+        "example.test",
+        retry_results=(expected,),
+    )
     process.assert_called_once()
     assert process.call_args.args[0] == source
     assert process.call_args.args[1] == "example.test"
-    assert process.call_args.kwargs == {"delete_source": False, "ephemeral": False}
+    assert process.call_args.kwargs == {
+        "delete_source": False,
+        "ephemeral": False,
+        "timeout": 45,
+    }
     archive_raw.assert_called_once()
     assert output.read_bytes() == b"RIFF-processed"
 

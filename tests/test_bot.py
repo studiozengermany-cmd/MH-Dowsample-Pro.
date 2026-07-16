@@ -1,5 +1,6 @@
 import asyncio
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -24,6 +25,7 @@ from bot import (
     main_menu,
     source_name_from_url,
 )
+from delivery_retry import DeliveryRetryStore
 from exceptions import (
     CrawlLimitError,
     CrawlTimeoutError,
@@ -32,7 +34,6 @@ from exceptions import (
     NoAudioFoundError,
     PathTraversalError,
 )
-from delivery_retry import DeliveryRetryStore
 
 
 def test_empty_stats_are_presented_in_vietnamese() -> None:
@@ -326,6 +327,58 @@ async def test_classification_updates_after_first_file_and_every_five(tmp_path) 
         len(call.kwargs["retry_results"])
         for call in bot._send_processed_files.await_args_list
     ] == [2, 4, 6]
+
+
+@pytest.mark.asyncio
+async def test_hung_tenth_file_is_skipped_and_batch_still_delivers(tmp_path) -> None:
+    import time
+
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=77),
+        effective_message=SimpleNamespace(
+            text="https://sounds.example.com/pack",
+            reply_text=AsyncMock(return_value=status_message),
+        ),
+    )
+    urls = [f"https://cdn.example.com/{index}.mp3" for index in range(11)]
+
+    def download(url, _raw_dir, _title):
+        path = tmp_path / Path(url).name
+        path.write_bytes(b"audio")
+        return path
+
+    def process(downloaded, *_args, **_kwargs):
+        if downloaded.name == "9.mp3":
+            time.sleep(0.2)
+        return {"status": "passed", "output": str(downloaded)}
+
+    bot = AudioBot.__new__(AudioBot)
+    bot.crawler = SimpleNamespace(
+        sniff_urls=AsyncMock(return_value=urls),
+        download=download,
+        discovered_titles={},
+    )
+    bot.gate = SimpleNamespace()
+    bot.processor = SimpleNamespace()
+    bot.organizer = SimpleNamespace()
+    bot.run_dir = tmp_path / "run"
+    bot._send_processed_files = AsyncMock()
+
+    with (
+        patch("bot.process_file", side_effect=process),
+        patch("bot.DEFAULT_WORKERS", 2),
+        patch("bot.JOB_BATCH_FILES", 200),
+        patch("bot.TELEGRAM_PROCESS_GUARD_SEC", 0.05),
+    ):
+        await bot.handle_url(update, None)
+
+    bot._send_processed_files.assert_awaited_once()
+    delivered = bot._send_processed_files.await_args.args[1]
+    assert sum(result["status"] == "passed" for result in delivered) == 10
+    assert sum(result["status"] == "file_timeout" for result in delivered) == 1
+    progress_messages = [call.args[0] for call in status_message.edit_text.await_args_list]
+    assert any("11/11" in text for text in progress_messages)
 
 
 @pytest.mark.asyncio

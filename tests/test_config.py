@@ -18,6 +18,7 @@ def test_delivery_defaults_are_safe_for_telegram() -> None:
     assert config.TELEGRAM_UPLOAD_TIMEOUT_SEC >= 30
     assert config.TELEGRAM_UPLOAD_RETRIES >= 1
     assert config.JOB_BATCH_FILES == 200
+    assert config.FILE_PROCESS_TIMEOUT_SEC < config.TELEGRAM_PROCESS_GUARD_SEC
 
 
 def test_integer_setting_honors_maximum(monkeypatch: pytest.MonkeyPatch) -> None:

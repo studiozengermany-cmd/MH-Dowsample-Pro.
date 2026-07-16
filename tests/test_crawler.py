@@ -521,10 +521,13 @@ def test_extensionless_audio_uses_title_and_content_type(
     assert result.name == "Warm Kick.mp3"
 
 
-def test_download_returns_none_when_pre_check_fails(tmp_path: Path) -> None:
+def test_download_returns_none_when_pre_check_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     gate = SimpleNamespace(pre_download_ok=lambda *_args: (False, "file type not supported"))
     session = SimpleNamespace(get=lambda *args, **kwargs: None, close=lambda: None, headers={})
     instance = AudioCrawler(tmp_path, gate=gate, session=session)
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
 
     result = instance.download("https://example.com/bad.txt")
     assert result is None

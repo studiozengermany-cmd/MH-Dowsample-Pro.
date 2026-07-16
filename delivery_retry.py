@@ -6,7 +6,7 @@ import json
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +70,7 @@ class DeliveryRetryStore:
             entries.append({"status": status, "path": relative})
             seen.add(relative)
 
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
         payload = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
         with self._connect() as conn:
             conn.execute(

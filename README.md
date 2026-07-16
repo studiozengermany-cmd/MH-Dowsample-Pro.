@@ -91,6 +91,9 @@ Edit `.env` before the first run. The defaults use folders inside the project di
 | `TARGET_SAMPLE_RATE` | Output sample rate | `44100` |
 | `WORKERS` | Concurrent processing workers | `4` |
 | `BATCH_SIZE` | Files processed per batch | `50` |
+| `JOB_BATCH_FILES` | URL files downloaded, processed, and delivered before the next job batch | `200` |
+| `FILE_PROCESS_TIMEOUT_SEC` | Hard audio-worker timeout for one file | `45` |
+| `TELEGRAM_PROCESS_GUARD_SEC` | Outer Telegram guard so one stuck file cannot block a batch | `60` |
 | `TELEGRAM_TOKEN` | Optional Telegram bot token | empty |
 | `ADMIN_USER_ID` | Allowed Telegram user ID | `0` |
 | `OWNER_DELIVERY_MODE` | Owner result mode: `local`, `telegram`, or `both` | `local` |

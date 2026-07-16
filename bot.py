@@ -42,10 +42,12 @@ from config import (
     DB_PATH,
     DEFAULT_WORKERS,
     DOWNLOAD_DIR,
+    FILE_PROCESS_TIMEOUT_SEC,
     JOB_BATCH_FILES,
     OUTPUT_DIR,
     OWNER_DELIVERY_MODE,
     TELEGRAM_ARCHIVE_PART_BYTES,
+    TELEGRAM_PROCESS_GUARD_SEC,
     TELEGRAM_TOKEN,
     TELEGRAM_UPLOAD_RETRIES,
     TELEGRAM_UPLOAD_TIMEOUT_SEC,
@@ -1020,7 +1022,7 @@ class AudioBot:
 
             async def process_one(downloaded: Path) -> Mapping[str, Any]:
                 async with process_semaphore:
-                    result = await loop.run_in_executor(
+                    processing = loop.run_in_executor(
                         None,
                         partial(
                             process_file,
@@ -1032,8 +1034,28 @@ class AudioBot:
                             self.run_dir,
                             delete_source=False,
                             ephemeral=False,
+                            timeout=FILE_PROCESS_TIMEOUT_SEC,
                         ),
                     )
+                    try:
+                        result = await asyncio.wait_for(
+                            processing,
+                            timeout=TELEGRAM_PROCESS_GUARD_SEC,
+                        )
+                    except TimeoutError:
+                        logger.error(
+                            "Bỏ qua file bị treo sau %.1f giây: %s",
+                            TELEGRAM_PROCESS_GUARD_SEC,
+                            downloaded,
+                        )
+                        return {
+                            "status": "file_timeout",
+                            "file": str(downloaded),
+                            "error": (
+                                "Telegram processing guard timed out after "
+                                f"{TELEGRAM_PROCESS_GUARD_SEC:.1f}s"
+                            ),
+                        }
                     source_hash = str(result.get("source_hash") or "")
                     if downloaded.exists() and source_hash:
                         try:
@@ -1062,11 +1084,11 @@ class AudioBot:
                     asyncio.create_task(download_one(audio_url))
                     for audio_url in batch_urls
                 ]
-                for completed, task in enumerate(
+                for completed, download_task in enumerate(
                     asyncio.as_completed(download_tasks), start=1
                 ):
                     try:
-                        downloaded = await task
+                        downloaded = await download_task
                         if downloaded is not None:
                             batch_downloaded.append(downloaded)
                             downloaded_total += 1
@@ -1097,11 +1119,11 @@ class AudioBot:
                     asyncio.create_task(process_one(downloaded))
                     for downloaded in batch_downloaded
                 ]
-                for batch_processed, task in enumerate(
+                for batch_processed, process_task in enumerate(
                     asyncio.as_completed(process_tasks), start=1
                 ):
                     try:
-                        batch_results.append(await task)
+                        batch_results.append(await process_task)
                     except Exception as exc:
                         logger.exception("Không thể xử lý một file trong hàng phân loại")
                         batch_results.append({"status": "error", "error": str(exc)})
@@ -1131,7 +1153,7 @@ class AudioBot:
                         update,
                         batch_results,
                         site,
-                        retry_results=results,
+                        retry_results=tuple(results),
                     )
                     delivered_batches += 1
                 try:
