@@ -34,7 +34,7 @@ and generated libraries are excluded from Git and remain on the user's machine.
 | Duplicate protection | Uses SHA-256 fingerprints and an SQLite inventory to avoid duplicate imports. |
 | Concurrent processing | Processes batches with configurable worker and batch counts. |
 | Guarded web discovery | Finds public audio assets through direct URLs, page resources, JSON responses, and media controls. |
-| Private Telegram control | Restricts bot commands to the configured administrator account. |
+| Approved Telegram access | Lets invited users submit public audio links after administrator approval. |
 
 ## Processing flow
 
@@ -93,6 +93,10 @@ Edit `.env` before the first run. The defaults use folders inside the project di
 | `BATCH_SIZE` | Files processed per batch | `50` |
 | `TELEGRAM_TOKEN` | Optional Telegram bot token | empty |
 | `ADMIN_USER_ID` | Allowed Telegram user ID | `0` |
+| `OWNER_DELIVERY_MODE` | Owner result mode: `local`, `telegram`, or `both` | `local` |
+| `TELEGRAM_ARCHIVE_PART_MB` | Maximum uncompressed size per Telegram ZIP part | `20` |
+| `TELEGRAM_UPLOAD_TIMEOUT_SEC` | Timeout for large Telegram uploads | `300` |
+| `TELEGRAM_UPLOAD_RETRIES` | Automatic retries for each Telegram ZIP part | `3` |
 
 See [`.env.example`](.env.example) for every available quality, crawler, timeout, and path setting.
 
@@ -152,13 +156,21 @@ python bot.py
 
 | Command | Purpose |
 | --- | --- |
-| `/start` | Display the usage guide. |
-| `/stats` | Show library statistics. |
-| `/path` | Show the configured output directory. |
-| `/dangnhap` | Open an interactive website login session for a supplied URL. |
-| `/organize` | Process a local folder. |
+| `/batdau` | Display access status or usage guide. |
+| `/yeucau MA_MOI` | Submit a one-time invite code for administrator approval. |
+| `/quyen` | Show current access status. |
+| `/thongke` | Show library statistics after approval. |
+| `/taoma` | Create a one-time invite code as administrator. |
+| `/thumuc` | Show the configured output directory to the administrator. |
+| `/datthumuc D:\Sample-Library` | Change and persist the administrator's output directory. |
+| `/sapxep` | Process a local folder on the host machine for the administrator. |
 
-Plain text URLs sent by the configured administrator are passed to the guarded crawler. Use this
+A user needs a one-time invite code and administrator approval before public commands or audio-link
+jobs become available. The bot then discovers and downloads public audio assets without opening an
+interactive login flow, and runs the shared quality, normalization, and classification pipeline. By
+default, the configured owner receives the local library path while approved users receive retryable
+20 MB Telegram ZIP parts. Set `OWNER_DELIVERY_MODE=telegram` or `both` to change the owner's delivery
+behavior. Host-machine commands remain scoped to the configured administrator account. Use this
 feature only for content you are authorized to access and download.
 
 ## Development
@@ -185,7 +197,7 @@ MH-Dowsample/
 ├── organizer.py          # Library placement and duplicate handling
 ├── library_layout.py     # Readable content-first paths
 ├── crawler.py            # Guarded browser and HTTP discovery
-├── bot.py                # Private Telegram interface
+├── bot.py                # Public Telegram interface with private host controls
 ├── utils/                # Database, paths, retries, and cleanup
 ├── tools/                # Development and benchmark utilities
 └── tests/                # Unit, concurrency, and end-to-end tests

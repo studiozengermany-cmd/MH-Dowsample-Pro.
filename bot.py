@@ -6,35 +6,63 @@ import asyncio
 import html
 import logging
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from telegram import BotCommand, Update
-from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from dotenv import set_key
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.error import RetryAfter, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
+from access_control import AccessControlStore, AccessStatus, RequestOutcome
 from config import (
     ADMIN_USER_ID,
-    CRAWL_TIMEOUT_SEC,
+    BASE_DIR,
+    DATA_DIR,
     DB_PATH,
     DOWNLOAD_DIR,
     OUTPUT_DIR,
+    OWNER_DELIVERY_MODE,
+    TELEGRAM_ARCHIVE_PART_BYTES,
     TELEGRAM_TOKEN,
+    TELEGRAM_UPLOAD_RETRIES,
+    TELEGRAM_UPLOAD_TIMEOUT_SEC,
     TEMP_ROOT,
     ensure_runtime_dirs,
     validate_bot_config,
 )
 from crawler import AudioCrawler
+from delivery import DeliveryService, build_result_archives
+from delivery import build_result_archive as build_result_archive
+from delivery import deliverable_paths as deliverable_paths
 from exceptions import (
-    AuthenticationRequiredError,
     BrowserUnavailableError,
+    ConfigError,
     CrawlerError,
+    CrawlLimitError,
     CrawlTimeoutError,
+    HTTPError,
     NetworkError,
+    NoAudioFoundError,
     PathTraversalError,
 )
 from organize import process_file, run_pipeline
@@ -44,6 +72,7 @@ from quality_gate import QualityGate
 from utils.cleanup import cleanup_run, setup_cleanup
 
 logger = logging.getLogger(__name__)
+ACCESS_DB_PATH = DATA_DIR / "access-control.db"
 
 _SECOND_LEVEL_SUFFIXES = {"co", "com", "net", "org", "gov", "edu", "ac"}
 
@@ -73,11 +102,12 @@ def format_stats(stats: Mapping[str, Any]) -> str:
     total = int(stats.get("total", 0))
     if total == 0:
         return (
-            "📊 <b>Kho âm thanh đang trống</b>\n\n"
-            "Anh gửi URL âm thanh hoặc liên kết từ một trang catalogue để em bắt đầu thu thập."
+            "📊 <b>KHO ÂM THANH ĐANG TRỐNG</b>\n\n"
+            "Dạ, anh/chị vui lòng gửi một liên kết có âm thanh. "
+            "Em sẽ hỗ trợ xử lý ngay khi nhận được liên kết."
         )
 
-    lines = ["📊 <b>Thống kê kho âm thanh</b>", "", f"• Tổng số mẫu: <b>{total}</b>"]
+    lines = ["📊 <b>THỐNG KÊ THƯ VIỆN</b>", "", f"• <b>Tổng số mẫu:</b> {total}"]
     sites = stats.get("sites", [])
     if sites:
         lines.extend(["", "<b>Theo nguồn</b>"])
@@ -125,7 +155,7 @@ def format_results(results: Sequence[Mapping[str, Any]], discovered_count: int) 
             )
         return (
             "⚠️ <b>Không tìm thấy âm thanh trong trang</b>\n\n"
-            "Trang có thể yêu cầu đăng nhập, chưa phát bản nghe thử hoặc đang chặn trình duyệt tự động."
+            "Trang có thể chưa phát bản nghe thử, vừa đổi cấu trúc hoặc đang chặn trình duyệt tự động."
         )
 
     counts = Counter(str(result.get("status", "error")) for result in results)
@@ -138,11 +168,11 @@ def format_results(results: Sequence[Mapping[str, Any]], discovered_count: int) 
     }
     for status, label in labels.items():
         if counts[status]:
-            lines.append(f"• {label}: <b>{counts[status]}</b>")
+            lines.append(f"• <b>{label}:</b> {counts[status]}")
 
     outputs = [result.get("output") for result in results if result.get("status") == "passed"]
     if outputs:
-        lines.extend(["", "<b>Tệp vừa lưu</b>"])
+        lines.extend(["", "<b>TỆP ĐÃ XỬ LÝ</b>"])
         for output in outputs[:5]:
             lines.append(f"• {html.escape(Path(str(output)).name)}")
         if len(outputs) > 5:
@@ -150,22 +180,76 @@ def format_results(results: Sequence[Mapping[str, Any]], discovered_count: int) 
     return "\n".join(lines)
 
 
+def format_link_progress(
+    stage: str,
+    *,
+    discovered: int = 0,
+    downloaded: int = 0,
+    processed: int = 0,
+    failed_downloads: int = 0,
+) -> str:
+    """Show completed work with green checks and only the current operation as pending."""
+    lines = ["🎧 <b>TIẾN TRÌNH XỬ LÝ</b>", "", "✅ <b>Đã nhận liên kết</b>"]
+    if stage == "searching":
+        lines.append("⏳ Đang tìm âm thanh...")
+        return "\n".join(lines)
+
+    lines.append(f"✅ <b>Đã tìm thấy:</b> {discovered} đường dẫn âm thanh")
+    if stage == "downloading":
+        lines.append(f"⏳ Đang tải tệp gốc: {downloaded}/{discovered}")
+        return "\n".join(lines)
+
+    lines.append(f"✅ <b>Đã tải tệp gốc:</b> {downloaded}")
+    if failed_downloads:
+        lines.append(f"⚠️ <b>Không tải được:</b> {failed_downloads} đường dẫn")
+    if stage == "analyzing":
+        lines.append(f"⏳ Đang kiểm tra và phân loại: {processed}/{downloaded}")
+        return "\n".join(lines)
+
+    lines.append(f"✅ <b>Đã kiểm tra và phân loại:</b> {processed} tệp")
+    lines.append("✅ <b>Hoàn tất xử lý</b>")
+    return "\n".join(lines)
+
+
+def format_link_failure(error_text: str) -> str:
+    return (
+        "🎧 <b>TIẾN TRÌNH XỬ LÝ</b>\n\n"
+        "✅ <b>Đã nhận liên kết</b>\n"
+        "❌ <b>Chưa hoàn tất xử lý</b>\n\n"
+        f"{error_text}"
+    )
+
+
 def format_crawler_error(exc: CrawlerError) -> str:
-    if isinstance(exc, AuthenticationRequiredError):
+    if isinstance(exc, NoAudioFoundError):
         return (
-            "🔐 <b>Trang này cần đăng nhập</b>\n\n"
-            "Anh gửi <code>/dangnhap URL_TRANG</code>, đăng nhập một lần trong cửa sổ Brave "
-            "rồi gửi lại liên kết mẫu."
+            "🔎 <b>Chưa tìm thấy tệp âm thanh trong liên kết này</b>\n\n"
+            "Trang có thể vừa đổi cấu trúc hoặc chưa cung cấp bản nghe thử công khai. "
+            "Bot đã dừng lượt này mà không chuyển sang thao tác khác."
         )
+    if isinstance(exc, CrawlLimitError):
+        return "📚 Catalogue vượt giới hạn quét an toàn. Em đã dừng để tránh trả kết quả bị thiếu."
     if isinstance(exc, CrawlTimeoutError):
-        return "⏱️ Trang phản hồi quá lâu. Em đã dừng lượt quét để Bot không bị treo."
+        return "⏱️ Trang phản hồi quá lâu. Em đã dừng lượt quét để trợ lý không bị treo."
     if isinstance(exc, BrowserUnavailableError):
-        return "🧩 Trình duyệt tự động chưa sẵn sàng. Anh báo em kiểm tra lại phần Chromium nhé."
+        return "🧩 Trình duyệt xử lý chưa sẵn sàng. Mong anh/chị vui lòng thử lại sau ít phút."
     if isinstance(exc, PathTraversalError):
-        return "🔗 Liên kết chưa hợp lệ. Anh hãy gửi liên kết đầy đủ bắt đầu bằng http:// hoặc https://."
+        return (
+            "🔗 Liên kết này chưa hợp lệ. Anh/chị vui lòng gửi liên kết đầy đủ "
+            "bắt đầu bằng http:// hoặc https://."
+        )
+    if isinstance(exc, HTTPError) and exc.status_code == 429:
+        return (
+            "⏳ <b>Trang đang tạm giới hạn lượt truy cập</b>\n\n"
+            "Bot đã tự thử lại nhưng trang vẫn yêu cầu chờ thêm. Không cần đăng nhập; "
+            "anh/chị chỉ cần gửi lại liên kết sau ít phút."
+        )
     if isinstance(exc, NetworkError):
-        return "🌐 Em chưa thể kết nối an toàn tới liên kết này. Anh kiểm tra lại link rồi gửi lại giúp em."
-    return "⚠️ Em chưa thể quét trang này. Anh thử gửi lại sau một lúc nhé."
+        return (
+            "🌐 Dạ, em chưa thể kết nối an toàn tới liên kết này. "
+            "Anh/chị vui lòng kiểm tra lại liên kết giúp em."
+        )
+    return "⚠️ Dạ, em chưa thể xử lý trang này. Mong anh/chị vui lòng thử lại sau."
 
 
 async def send_chunked(update: Update, text: str) -> None:
@@ -175,50 +259,483 @@ async def send_chunked(update: Update, text: str) -> None:
         await update.effective_message.reply_text(text[start : start + 3900], parse_mode="HTML")
 
 
-def _authorized(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id == ADMIN_USER_ID)
+def format_welcome() -> str:
+    """Explain the same adaptive workflow to every user."""
+    return format_admin_welcome()
+
+
+def format_admin_welcome() -> str:
+    """Explain the automatic crawl-filter-return flow."""
+    return (
+        "🎧 <b>MH - DOWNSAMPLE PRO</b>\n\n"
+        "Bot hỗ trợ tìm và xử lý âm thanh từ nhiều trang khác nhau. Anh không cần chọn "
+        "trước một nền tảng cố định.\n\n"
+        "<b>CÁCH SỬ DỤNG</b>\n"
+        "1. Gửi liên kết của trang hoặc tệp âm thanh cần xử lý.\n"
+        "2. Bot tự tìm và tải các tệp âm thanh công khai trong liên kết.\n"
+        "3. Tệp tải về được kiểm tra chất lượng, chuẩn hóa và phân loại.\n"
+        "4. Bot gửi lại các tệp đạt chất lượng ngay trong cuộc trò chuyện này."
+    )
+
+
+def format_usage_guide() -> str:
+    """Explain the one primary user journey without repeating product features."""
+    return (
+        "📖 <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n"
+        "Dạ, anh/chị chỉ cần thực hiện ba bước sau:\n\n"
+        "1. Sao chép liên kết của trang hoặc tệp âm thanh cần xử lý.\n"
+        "2. Dán liên kết vào ô tin nhắn trong cuộc trò chuyện này rồi bấm gửi.\n"
+        "3. Em sẽ tự tải, lọc chất lượng và gửi lại tệp kết quả ngay trên Telegram."
+    )
+
+
+def main_menu(*, is_admin: bool = False) -> InlineKeyboardMarkup:
+    """Build the public action menu and append private host actions for the administrator."""
+    public_rows = [
+        [InlineKeyboardButton("🔗 Gửi liên kết âm thanh", callback_data="menu:gui_lien_ket")],
+        [
+            InlineKeyboardButton("📖 Xem hướng dẫn", callback_data="menu:huong_dan"),
+            InlineKeyboardButton("📊 Xem thống kê", callback_data="menu:thong_ke"),
+        ],
+    ]
+    if is_admin:
+        return InlineKeyboardMarkup(
+            [
+                *public_rows,
+                [
+                    InlineKeyboardButton("📁 Xử lý thư mục", callback_data="menu:sap_xep"),
+                    InlineKeyboardButton("⚙️ Nơi lưu", callback_data="menu:cai_dat_thu_muc"),
+                ],
+            ]
+        )
+    return InlineKeyboardMarkup(public_rows)
+
+
+def back_to_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Quay lại", callback_data="menu:quay_lai")]])
+
+
+ACCESS_STATUS_LABELS = {
+    AccessStatus.PENDING: "Đang chờ duyệt",
+    AccessStatus.APPROVED: "Đã được duyệt",
+    AccessStatus.REJECTED: "Đã bị từ chối",
+    AccessStatus.BLOCKED: "Đã bị chặn",
+    AccessStatus.REVOKED: "Đã bị thu hồi",
+}
+
+
+def access_gate_text(status: AccessStatus | None) -> str:
+    if status is AccessStatus.PENDING:
+        return (
+            "⏳ <b>YÊU CẦU ĐANG CHỜ DUYỆT</b>\n\n"
+            "Anh/chị chưa thể gửi job cho đến khi quản trị viên phê duyệt."
+        )
+    if status is AccessStatus.BLOCKED:
+        return "⛔ <b>TÀI KHOẢN ĐÃ BỊ CHẶN</b>\n\nTài khoản này không thể gửi yêu cầu mới."
+    if status is AccessStatus.REJECTED:
+        title = "❌ <b>YÊU CẦU ĐÃ BỊ TỪ CHỐI</b>"
+    elif status is AccessStatus.REVOKED:
+        title = "🔒 <b>QUYỀN SỬ DỤNG ĐÃ BỊ THU HỒI</b>"
+    else:
+        title = "🔐 <b>BOT CHỈ DÀNH CHO NGƯỜI ĐÃ ĐƯỢC DUYỆT</b>"
+    return (
+        f"{title}\n\n"
+        "Để gửi yêu cầu sử dụng, anh/chị cần mã mời dùng một lần từ quản trị viên."
+    )
+
+
+def access_request_keyboard(status: AccessStatus | None) -> InlineKeyboardMarkup | None:
+    if status in {None, AccessStatus.REJECTED, AccessStatus.REVOKED}:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔐 Gửi yêu cầu sử dụng", callback_data="access:request")]]
+        )
+    return None
+
+
+def admin_access_keyboard(user_id: int, status: AccessStatus) -> InlineKeyboardMarkup:
+    prefix = f"access:admin:{{action}}:{user_id}:{status.value}"
+    if status is AccessStatus.PENDING:
+        actions = [("✅ Duyệt", "approve"), ("❌ Từ chối", "reject"), ("⛔ Chặn", "block")]
+    elif status is AccessStatus.APPROVED:
+        actions = [("🔒 Thu hồi", "revoke"), ("⛔ Chặn", "block")]
+    elif status is AccessStatus.BLOCKED:
+        actions = [("✅ Duyệt lại", "approve")]
+    else:
+        actions = [("✅ Duyệt", "approve"), ("⛔ Chặn", "block")]
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(label, callback_data=prefix.format(action=action))
+                for label, action in actions
+            ]
+        ]
+    )
 
 
 class AudioBot:
     def __init__(self) -> None:
         validate_bot_config()
         ensure_runtime_dirs()
+        if ACCESS_DB_PATH.resolve() == DB_PATH.resolve():
+            raise ConfigError("Access-control database must differ from audio-library database")
+        self.access_control = AccessControlStore(ACCESS_DB_PATH)
         self.run_dir = setup_cleanup(TEMP_ROOT)
         self.gate = QualityGate()
         self.processor = AudioProcessor()
-        self.organizer = Organizer(OUTPUT_DIR, DB_PATH)
+        self.output_dir = OUTPUT_DIR.resolve()
+        self.organizer = Organizer(self.output_dir, DB_PATH)
         migration = self.organizer.ensure_layout(DOWNLOAD_DIR)
         if migration["organized"] or migration["raw"] or migration["missing"]:
             logger.info("Đã tự nâng cấp bố cục thư viện: %s", migration)
         self.crawler = AudioCrawler(DOWNLOAD_DIR, self.gate)
-        self.login_task: asyncio.Task[None] | None = None
+        self.url_job_lock = asyncio.Lock()
+        self.profile_retry_task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def _is_admin(update: Update) -> bool:
+        user = getattr(update, "effective_user", None)
+        return bool(user and user.id == ADMIN_USER_ID)
+
+    def _access_status(self, update: Update) -> AccessStatus | None:
+        user = getattr(update, "effective_user", None)
+        if not user:
+            return None
+        if user.id == ADMIN_USER_ID:
+            return AccessStatus.APPROVED
+        return self.access_control.status_for(user.id)
+
+    def _has_access(self, update: Update) -> bool:
+        return self._access_status(update) is AccessStatus.APPROVED
+
+    async def _reply_access_gate(self, update: Update) -> None:
+        message = update.effective_message
+        if not message:
+            return
+        status = self._access_status(update)
+        await message.reply_text(
+            access_gate_text(status),
+            parse_mode="HTML",
+            reply_markup=access_request_keyboard(status),
+        )
 
     async def cmd_start(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-        if _authorized(update):
-            await send_chunked(
-                update,
-                "🎧 <b>MH - Dowsample Pro đã sẵn sàng</b>\n\n"
-                "Anh gửi cho em một URL âm thanh hoặc liên kết từ bất kỳ trang catalogue nào. "
-                "Em sẽ tự động:\n"
-                "• Tìm và giữ toàn bộ tệp âm thanh gốc vào kho raw\n"
-                "• Kiểm tra, chuẩn hóa thành WAV\n"
-                "• Phân loại theo nhịp độ, tông và thể loại\n"
-                "• Lưu vào thư viện của anh\n\n"
-                "<b>Lệnh nhanh</b>\n"
-                "/stats — Xem thống kê thư viện\n"
-                "/path — Xem thư mục lưu nhạc\n"
-                "/dangnhap URL — Đăng nhập website cần dùng\n"
-                "/organize ĐƯỜNG_DẪN — Xử lý một thư mục trên máy",
+        if not update.effective_message:
+            return
+        if not self._has_access(update):
+            await self._reply_access_gate(update)
+            return
+        is_admin = self._is_admin(update)
+        await update.effective_message.reply_text(
+            format_welcome(),
+            parse_mode="HTML",
+            reply_markup=main_menu(is_admin=is_admin),
+        )
+
+    async def cmd_request_access(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if not message or not user:
+            return
+        if self._is_admin(update):
+            await message.reply_text("✅ Tài khoản quản trị luôn có quyền sử dụng.")
+            return
+        invite_code = "".join(context.args).strip() if context.args else ""
+        if not invite_code:
+            await message.reply_text(
+                "🔐 <b>GỬI YÊU CẦU SỬ DỤNG</b>\n\n"
+                "Nhập lệnh <code>/yeucau MA_MOI</code> bằng mã dùng một lần do quản trị viên cấp.",
+                parse_mode="HTML",
+            )
+            return
+        outcome = self.access_control.submit_request(
+            telegram_user_id=user.id,
+            username=getattr(user, "username", None),
+            full_name=getattr(user, "full_name", None),
+            invite_code=invite_code,
+        )
+        if outcome is RequestOutcome.ALREADY_APPROVED:
+            await message.reply_text("✅ Tài khoản đã được duyệt và có thể gửi liên kết.")
+            return
+        if outcome is RequestOutcome.ALREADY_PENDING:
+            await message.reply_text("⏳ Yêu cầu của anh/chị đang chờ quản trị viên duyệt.")
+            return
+        if outcome is RequestOutcome.BLOCKED:
+            await message.reply_text("⛔ Tài khoản đã bị chặn và không thể gửi yêu cầu mới.")
+            return
+        if outcome is RequestOutcome.INVALID_INVITE:
+            await message.reply_text("❌ Mã mời không hợp lệ, đã được dùng hoặc đã hết hạn.")
+            return
+
+        await message.reply_text(
+            "✅ <b>ĐÃ GỬI YÊU CẦU</b>\n\n"
+            "Quản trị viên sẽ xem xét. Anh/chị chỉ có thể gửi job sau khi được duyệt.",
+            parse_mode="HTML",
+        )
+        username = html.escape(f"@{user.username}" if getattr(user, "username", None) else "Không có")
+        full_name = html.escape(str(getattr(user, "full_name", None) or "Không có"))
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    "🔐 <b>YÊU CẦU QUYỀN MỚI</b>\n\n"
+                    f"• Telegram ID: <code>{user.id}</code>\n"
+                    f"• Tên: {full_name}\n"
+                    f"• Username: {username}"
+                ),
+                parse_mode="HTML",
+                reply_markup=admin_access_keyboard(user.id, AccessStatus.PENDING),
+            )
+            await self.backup_database_to_telegram(context)
+        except TelegramError:
+            logger.exception("Không thể gửi thông báo yêu cầu quyền cho quản trị viên")
+
+    async def cmd_create_invite(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not self._is_admin(update) or not update.effective_message:
+            return
+        hours = 24
+        if context.args:
+            try:
+                hours = int(context.args[0])
+            except ValueError:
+                hours = 0
+        if not 1 <= hours <= 168:
+            await update.effective_message.reply_text(
+                "⚠️ Thời hạn mã mời phải từ 1 đến 168 giờ. Ví dụ: <code>/taoma 24</code>",
+                parse_mode="HTML",
+            )
+            return
+        code = self.access_control.create_invite(
+            created_by=ADMIN_USER_ID,
+            ttl=timedelta(hours=hours),
+        )
+        await self.backup_database_to_telegram(context)
+        await update.effective_message.reply_text(
+            "🔑 <b>MÃ MỜI DÙNG MỘT LẦN</b>\n\n"
+            f"<code>{code}</code>\n\n"
+            f"Hết hạn sau {hours} giờ. Người dùng gửi: <code>/yeucau {code}</code>",
+            parse_mode="HTML",
+        )
+
+    async def cmd_access_status(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if not message or not user:
+            return
+        is_admin = self._is_admin(update)
+        target_id = user.id
+        if is_admin and context.args:
+            try:
+                target_id = int(context.args[0])
+            except ValueError:
+                await message.reply_text("⚠️ Telegram ID phải là một số nguyên.")
+                return
+        record = self.access_control.get_user(target_id)
+        if record is None:
+            text = "ℹ️ Tài khoản chưa gửi yêu cầu sử dụng."
+            if is_admin and target_id != user.id:
+                text += f"\nTelegram ID: <code>{target_id}</code>"
+            await message.reply_text(text, parse_mode="HTML")
+            return
+        label = ACCESS_STATUS_LABELS[record.status]
+        if is_admin:
+            await message.reply_text(
+                "🔐 <b>TRẠNG THÁI QUYỀN</b>\n\n"
+                f"• Telegram ID: <code>{record.telegram_user_id}</code>\n"
+                f"• Trạng thái: <b>{label}</b>",
+                parse_mode="HTML",
+                reply_markup=admin_access_keyboard(record.telegram_user_id, record.status),
+            )
+        else:
+            await message.reply_text(
+                "🔐 <b>TRẠNG THÁI QUYỀN CỦA BẠN</b>\n\n"
+                f"Trạng thái: <b>{label}</b>",
+                parse_mode="HTML",
             )
 
+    async def handle_access_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        data = query.data or ""
+        if data == "access:request":
+            await query.answer()
+            status = self._access_status(update)
+            if status is AccessStatus.BLOCKED:
+                await query.edit_message_text(access_gate_text(status), parse_mode="HTML")
+                return
+            if status is AccessStatus.APPROVED:
+                await query.edit_message_text(
+                    format_welcome(),
+                    parse_mode="HTML",
+                    reply_markup=main_menu(is_admin=self._is_admin(update)),
+                )
+                return
+            await query.edit_message_text(
+                "🔐 <b>GỬI YÊU CẦU SỬ DỤNG</b>\n\n"
+                "Nhập <code>/yeucau MA_MOI</code> bằng mã dùng một lần do quản trị viên cấp.",
+                parse_mode="HTML",
+            )
+            return
+        if not data.startswith("access:admin:"):
+            await query.answer()
+            return
+        if not self._is_admin(update):
+            await query.answer("Bạn không có quyền quản trị.", show_alert=True)
+            return
+        await query.answer()
+        parts = data.split(":")
+        if len(parts) != 5:
+            return
+        action = parts[2]
+        try:
+            target_id = int(parts[3])
+            expected_status = AccessStatus(parts[4])
+        except ValueError:
+            return
+        status_by_action = {
+            "approve": AccessStatus.APPROVED,
+            "reject": AccessStatus.REJECTED,
+            "block": AccessStatus.BLOCKED,
+            "revoke": AccessStatus.REVOKED,
+        }
+        new_status = status_by_action.get(action)
+        if new_status is None:
+            return
+        changed = self.access_control.set_status(
+            target_id,
+            new_status,
+            decided_by=ADMIN_USER_ID,
+            expected_status=expected_status,
+        )
+        if not changed:
+            current = self.access_control.get_user(target_id)
+            if current is None:
+                await query.edit_message_text("⚠️ Không tìm thấy yêu cầu quyền này.")
+                return
+            await query.edit_message_text(
+                "⚠️ <b>TRẠNG THÁI ĐÃ THAY ĐỔI</b>\n\n"
+                f"• Telegram ID: <code>{target_id}</code>\n"
+                f"• Trạng thái hiện tại: <b>{ACCESS_STATUS_LABELS[current.status]}</b>",
+                parse_mode="HTML",
+                reply_markup=admin_access_keyboard(target_id, current.status),
+            )
+            return
+        label = ACCESS_STATUS_LABELS[new_status]
+        await query.edit_message_text(
+            "🔐 <b>ĐÃ CẬP NHẬT QUYỀN</b>\n\n"
+            f"• Telegram ID: <code>{target_id}</code>\n"
+            f"• Trạng thái: <b>{label}</b>",
+            parse_mode="HTML",
+            reply_markup=admin_access_keyboard(target_id, new_status),
+        )
+        await self.backup_database_to_telegram(context)
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"🔐 Trạng thái quyền sử dụng của bạn: <b>{label}</b>",
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            logger.warning("Không thể báo trạng thái quyền cho Telegram ID %s", target_id)
+
+    async def handle_authorized_menu(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if self._has_access(update):
+            await self.handle_menu(update, context)
+            return
+        if update.callback_query:
+            await update.callback_query.answer("Quyền sử dụng chưa được duyệt.", show_alert=True)
+
+    async def cmd_authorized_stats(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if self._has_access(update):
+            await self.cmd_stats(update, context)
+            return
+        await self._reply_access_gate(update)
+
+    async def handle_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        await query.answer()
+        action = (query.data or "").removeprefix("menu:")
+        is_admin = self._is_admin(update)
+
+        if action == "quay_lai":
+            await query.edit_message_text(
+                format_welcome(),
+                parse_mode="HTML",
+                reply_markup=main_menu(is_admin=is_admin),
+            )
+            return
+        if action == "gui_lien_ket":
+            await query.edit_message_text(
+                "🔗 <b>GỬI LIÊN KẾT ÂM THANH</b>\n\n"
+                "Dạ, anh/chị vui lòng dán liên kết vào ô tin nhắn bên dưới rồi bấm gửi nhé.\n\n"
+                "Liên kết hợp lệ bắt đầu bằng <code>http://</code> hoặc <code>https://</code>.",
+                parse_mode="HTML",
+                reply_markup=back_to_menu(),
+            )
+            return
+        if action == "huong_dan":
+            await query.edit_message_text(
+                format_usage_guide(),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🔗 Gửi liên kết ngay", callback_data="menu:gui_lien_ket")],
+                        [InlineKeyboardButton("⬅️ Quay lại", callback_data="menu:quay_lai")],
+                    ]
+                ),
+            )
+            return
+        if action == "thong_ke":
+            await query.edit_message_text(
+                format_stats(self.organizer.get_stats()),
+                parse_mode="HTML",
+                reply_markup=back_to_menu(),
+            )
+            return
+        if action == "sap_xep" and is_admin:
+            await query.edit_message_text(
+                "📁 <b>XỬ LÝ THƯ MỤC TRÊN MÁY CHỦ</b>\n\n"
+                "Gửi lệnh sau, thay phần đường dẫn bằng thư mục cần xử lý:\n\n"
+                "<code>/sapxep D:\\Thu-muc-am-thanh</code>",
+                parse_mode="HTML",
+                reply_markup=back_to_menu(),
+            )
+            return
+        if action == "cai_dat_thu_muc" and is_admin:
+            current = html.escape(str(self.output_dir))
+            await query.edit_message_text(
+                "⚙️ <b>CÀI ĐẶT NƠI LƯU SAMPLE</b>\n\n"
+                f"Thư mục hiện tại: <code>{current}</code>\n\n"
+                "Để đổi nơi lưu, gửi lệnh sau kèm đường dẫn tuyệt đối:\n"
+                "<code>/datthumuc D:\\Sample-Library</code>\n\n"
+                "Thiết lập mới được áp dụng ngay và lưu lại cho lần mở bot sau.",
+                parse_mode="HTML",
+                reply_markup=back_to_menu(),
+            )
+            return
+        return
+
     async def cmd_stats(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-        if _authorized(update):
-            await send_chunked(update, format_stats(self.organizer.get_stats()))
+        await send_chunked(update, format_stats(self.organizer.get_stats()))
 
     async def cmd_path(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-        if _authorized(update):
+        if self._is_admin(update):
             raw_path = html.escape(str(DOWNLOAD_DIR.resolve()))
-            organized_path = html.escape(str(OUTPUT_DIR.resolve()))
+            organized_path = html.escape(str(self.output_dir))
             await send_chunked(
                 update,
                 "📁 <b>Thư mục lưu âm thanh</b>\n\n"
@@ -226,13 +743,54 @@ class AudioBot:
                 f"Bản đã phân loại: <code>{organized_path}</code>",
             )
 
+    async def cmd_set_output(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_admin(update):
+            return
+        raw_path = " ".join(context.args).strip() if context.args else ""
+        if not raw_path:
+            await send_chunked(
+                update,
+                "⚙️ <b>CHỌN NƠI LƯU SAMPLE</b>\n\n"
+                f"Hiện tại: <code>{html.escape(str(self.output_dir))}</code>\n\n"
+                "Ví dụ: <code>/datthumuc D:\\Sample-Library</code>",
+            )
+            return
+        target = Path(raw_path).expanduser()
+        if not target.is_absolute():
+            await send_chunked(update, "⚠️ Anh hãy nhập đường dẫn đầy đủ, ví dụ D:\\Sample-Library.")
+            return
+        previous = self.output_dir
+        try:
+            resolved = target.resolve()
+            run_dir = getattr(self, "run_dir", None)
+            if run_dir:
+                resolved_run_dir = Path(run_dir).resolve()
+                if resolved == resolved_run_dir or resolved.is_relative_to(resolved_run_dir):
+                    raise OSError("output directory cannot be inside temporary run directory")
+            resolved.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=resolved, prefix=".write-test-", delete=True):
+                pass
+            set_key(BASE_DIR / ".env", "OUTPUT_DIR", str(resolved), quote_mode="always")
+        except OSError:
+            logger.exception("Không thể thiết lập thư mục đầu ra %s", target)
+            await send_chunked(update, "❌ Không thể tạo hoặc ghi vào thư mục này.")
+            return
+        self.output_dir = resolved
+        self.organizer.output_dir = resolved
+        await send_chunked(
+            update,
+            "✅ <b>ĐÃ ĐỔI NƠI LƯU SAMPLE</b>\n\n"
+            f"Thư mục mới: <code>{html.escape(str(resolved))}</code>\n\n"
+            f"Tệp cũ vẫn được giữ nguyên tại <code>{html.escape(str(previous))}</code>.",
+        )
+
     async def cmd_organize(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update):
+        if not self._is_admin(update):
             return
         if not context.args:
             await send_chunked(
                 update,
-                "⚠️ Anh chưa nhập đường dẫn thư mục.\n\nVí dụ: <code>/organize D:\\Thu-vien-am-thanh</code>",
+                "⚠️ Anh chưa nhập đường dẫn thư mục.\n\nVí dụ: <code>/sapxep D:\\Thu-vien-am-thanh</code>",
             )
             return
         path = Path(" ".join(context.args)).expanduser()
@@ -241,7 +799,7 @@ class AudioBot:
             return
         await send_chunked(update, "⏳ Em đang quét và xử lý thư mục. Anh chờ em một chút nhé...")
         try:
-            counts = await run_pipeline(path, OUTPUT_DIR, "telegram", delete_source=False)
+            counts = await run_pipeline(path, self.output_dir, "telegram", delete_source=False)
             await send_chunked(update, format_counts(counts))
         except Exception:
             logger.exception("Không thể xử lý thư mục %s", path)
@@ -249,28 +807,62 @@ class AudioBot:
                 update, "❌ Em chưa xử lý được thư mục này. Anh kiểm tra lại tệp và thử lại nhé."
             )
 
-    async def handle_url(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update) or not update.effective_message:
+    def _delivery_service(self) -> DeliveryService:
+        return DeliveryService(
+            output_root=self.output_dir,
+            temp_root=self.run_dir,
+            owner_mode=OWNER_DELIVERY_MODE,
+            archive_part_bytes=TELEGRAM_ARCHIVE_PART_BYTES,
+            upload_retries=TELEGRAM_UPLOAD_RETRIES,
+            upload_timeout_sec=TELEGRAM_UPLOAD_TIMEOUT_SEC,
+            archive_builder=build_result_archives,
+        )
+
+    async def _send_archive_with_retry(
+        self, message: Any, archive_path: Path, caption: str
+    ) -> bool:
+        """Compatibility adapter; retry ownership lives in DeliveryService."""
+        service = DeliveryService(
+            output_root=Path(),
+            temp_root=archive_path.parent,
+            owner_mode=OWNER_DELIVERY_MODE,
+            archive_part_bytes=TELEGRAM_ARCHIVE_PART_BYTES,
+            upload_retries=TELEGRAM_UPLOAD_RETRIES,
+            upload_timeout_sec=TELEGRAM_UPLOAD_TIMEOUT_SEC,
+        )
+        return await service.send_archive_with_retry(message, archive_path, caption)
+
+    async def _send_processed_files(
+        self, update: Update, results: Sequence[Mapping[str, Any]], site: str
+    ) -> None:
+        message = update.effective_message
+        if not message:
             return
-        if self.login_task and not self.login_task.done():
-            await send_chunked(
-                update,
-                "🔐 <b>Phiên đăng nhập website vẫn đang mở</b>\n\n"
-                "Nếu anh đã đăng nhập xong, hãy đóng toàn bộ cửa sổ Brave riêng. "
-                "Chờ Bot xác minh thành công rồi gửi lại liên kết; em chưa bắt đầu quét lúc này.",
-            )
+        await self._delivery_service().deliver(
+            message,
+            results,
+            site,
+            is_owner=self._is_admin(update),
+        )
+
+    async def handle_url(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_message:
             return
         url = (update.effective_message.text or "").strip()
+        site = source_name_from_url(url)
+        logger.info("Bắt đầu xử lý liên kết từ %s", site)
         status_message = await update.effective_message.reply_text(
-            f"⏳ Em đã nhận liên kết. Đang tìm âm thanh, tối đa {CRAWL_TIMEOUT_SEC:g} giây...",
+            format_link_progress("searching"),
             parse_mode="HTML",
         )
         try:
             urls = await self.crawler.sniff_urls(url)
-            site = source_name_from_url(url)
+            if not urls:
+                raise NoAudioFoundError(f"No public audio assets were discovered on {site}")
+            logger.info("Đã tìm thấy %d đường dẫn âm thanh từ %s", len(urls), site)
             raw_dir = DOWNLOAD_DIR / site
             await status_message.edit_text(
-                f"🎯 Đã tìm thấy <b>{len(urls)}</b> URL âm thanh. Đang tải toàn bộ về kho raw...",
+                format_link_progress("downloading", discovered=len(urls)),
                 parse_mode="HTML",
             )
             results = []
@@ -301,17 +893,40 @@ class AudioBot:
                         failures += 1
                 except CrawlerError as exc:
                     failures += 1
-                    logger.warning("Không tải được một URL âm thanh: %s", exc)
+                    logger.warning("Không tải được một đường dẫn âm thanh: %s", exc)
                 if completed % 10 == 0 or completed == len(tasks):
                     try:
                         await status_message.edit_text(
-                            f"⬇️ Đang tải: <b>{completed}/{len(tasks)}</b> URL — "
-                            f"đã lưu <b>{len(downloaded_files)}</b> tệp raw...",
+                            format_link_progress(
+                                "downloading",
+                                discovered=len(urls),
+                                downloaded=completed,
+                                failed_downloads=failures,
+                            ),
                             parse_mode="HTML",
                         )
                     except TelegramError:
                         pass
 
+            if not downloaded_files:
+                await status_message.edit_text(
+                    format_link_failure(
+                        f"⚠️ Không tải được tệp âm thanh nào từ {len(urls)} đường dẫn đã tìm thấy. "
+                        "Trang có thể đã đổi cách cung cấp bản nghe thử hoặc tạm thời từ chối tải."
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+
+            await status_message.edit_text(
+                format_link_progress(
+                    "analyzing",
+                    discovered=len(urls),
+                    downloaded=len(downloaded_files),
+                    failed_downloads=failures,
+                ),
+                parse_mode="HTML",
+            )
             for processed, downloaded in enumerate(downloaded_files, start=1):
                 result = await loop.run_in_executor(
                     None,
@@ -348,104 +963,126 @@ class AudioBot:
                 if processed % 10 == 0 or processed == len(downloaded_files):
                     try:
                         await status_message.edit_text(
-                            f"🎛️ Đã giữ đủ raw. Đang phân tích: "
-                            f"<b>{processed}/{len(downloaded_files)}</b> tệp...",
+                            format_link_progress(
+                                "analyzing",
+                                discovered=len(urls),
+                                downloaded=len(downloaded_files),
+                                processed=processed,
+                                failed_downloads=failures,
+                            ),
                             parse_mode="HTML",
                         )
                     except TelegramError:
                         pass
-            raw_path = html.escape(str(raw_dir.resolve()))
             await status_message.edit_text(
-                "✅ <b>Đã hoàn tất thu thập</b>\n\n"
-                f"• URL âm thanh tìm thấy: <b>{len(urls)}</b>\n"
-                f"• Tệp raw đã giữ lại: <b>{len(downloaded_files)}</b>\n"
-                f"• URL tải lỗi: <b>{failures}</b>\n"
-                f"• Thư mục raw: <code>{raw_path}</code>",
+                format_link_progress(
+                    "complete",
+                    discovered=len(urls),
+                    downloaded=len(downloaded_files),
+                    processed=len(results),
+                    failed_downloads=failures,
+                ),
                 parse_mode="HTML",
             )
-            await send_chunked(update, format_results(results, len(urls)))
+            await self._send_processed_files(update, results, site)
         except CrawlerError as exc:
-            logger.warning("Không thể quét liên kết: %s", exc)
-            await send_chunked(update, format_crawler_error(exc))
+            logger.warning("Không thể quét liên kết từ %s: %s", site, exc)
+            error_text = format_crawler_error(exc)
+            try:
+                await status_message.edit_text(
+                    format_link_failure(error_text),
+                    parse_mode="HTML",
+                )
+            except TelegramError:
+                logger.warning("Không thể cập nhật tin nhắn tiến trình; gửi thông báo mới thay thế")
+                await update.effective_message.reply_text(
+                    format_link_failure(error_text),
+                    parse_mode="HTML",
+                )
         except Exception:
             logger.exception("Lỗi ngoài dự kiến khi xử lý liên kết")
-            await send_chunked(
-                update, "❌ Có lỗi ngoài dự kiến. Em đã dừng an toàn; anh thử lại giúp em nhé."
+            error_text = (
+                "⚠️ Dạ, hệ thống vừa gặp lỗi ngoài dự kiến và đã dừng an toàn. "
+                "Mong anh/chị vui lòng thử lại giúp em."
             )
+            try:
+                await status_message.edit_text(format_link_failure(error_text), parse_mode="HTML")
+            except TelegramError:
+                await send_chunked(update, error_text)
 
-    async def cmd_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update):
+    async def handle_authorized_url(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Check approval and serialize access to shared URL-pipeline state."""
+        if not self._has_access(update):
+            await self._reply_access_gate(update)
             return
-        if not self.crawler.interactive_login_supported:
-            await send_chunked(
-                update,
-                "❌ Máy chưa có Brave hoặc Edge để mở cửa sổ đăng nhập website.",
-            )
+        if not hasattr(self, "url_job_lock"):
+            self.url_job_lock = asyncio.Lock()
+        if self.url_job_lock.locked():
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    "⏳ Bot đang xử lý một job khác. Anh/chị vui lòng gửi lại liên kết sau."
+                )
             return
-        if self.login_task and not self.login_task.done():
-            await send_chunked(update, "⏳ Cửa sổ đăng nhập đang mở. Anh hoàn tất đăng nhập giúp em nhé.")
-            return
-        login_url = " ".join(context.args).strip() if context.args else "https://splice.com/accounts/sign-in"
-        try:
-            site = source_name_from_url(login_url)
-            parsed_login = urlparse(login_url)
-            if parsed_login.scheme not in {"http", "https"} or not parsed_login.hostname:
-                raise ValueError
-        except ValueError:
-            await send_chunked(
-                update,
-                "⚠️ URL đăng nhập chưa hợp lệ. Ví dụ: <code>/dangnhap https://example.com</code>",
-            )
-            return
-        await send_chunked(
-            update,
-            "🔐 Em đang mở cửa sổ Brave riêng cho MH-Dowsample.\n\n"
-            f"Website: <b>{html.escape(site)}</b>\n"
-            "Anh tự đăng nhập trong cửa sổ đó. Em không đọc hoặc lưu mật khẩu của anh.\n\n"
-            "Sau khi đăng nhập xong, <b>anh tự đóng cửa sổ Brave</b>. "
-            "Bot sẽ chờ tối đa 15 phút rồi mới tự dừng.",
-        )
-        self.login_task = context.application.create_task(self._finish_login(update, login_url, site))
+        async with self.url_job_lock:
+            if not self._has_access(update):
+                await self._reply_access_gate(update)
+                return
+            await self.handle_url(update, context)
 
-    async def _finish_login(self, update: Update, login_url: str, site: str) -> None:
+    async def backup_database_to_telegram(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
-            logged_in = await self.crawler.login_site(login_url)
-            if logged_in:
-                await send_chunked(
-                    update,
-                    f"✅ <b>Đã lưu phiên đăng nhập {html.escape(site)}</b>\n\n"
-                    "Anh gửi lại liên kết mẫu âm thanh để em quét nhé.",
-                )
-            else:
-                await send_chunked(
-                    update,
-                    f"⚠️ <b>Chưa xác minh được phiên {html.escape(site)}</b>\n\n"
-                    "Cửa sổ đã đóng hoặc hết thời gian chờ, nhưng Bot chưa mở lại được website. "
-                    "Anh gửi lại lệnh /dangnhap kèm URL để thử lại nhé.",
-                )
-        except CrawlerError as exc:
-            logger.warning("Không thể đăng nhập %s: %s", site, exc)
-            await send_chunked(update, format_crawler_error(exc))
-        except Exception:
-            logger.exception("Lỗi ngoài dự kiến khi đăng nhập %s", site)
-            await send_chunked(update, "❌ Không mở được phiên đăng nhập website. Anh thử lại giúp em nhé.")
-        finally:
-            self.login_task = None
+            self.access_control.checkpoint()
+            message = await context.bot.send_document(
+                chat_id=ADMIN_USER_ID,
+                document=open(ACCESS_DB_PATH, "rb"),
+                filename="access-control.db",
+                caption="📦 Bản sao lưu dữ liệu phân quyền tự động.",
+            )
+            await context.bot.pin_chat_message(
+                chat_id=ADMIN_USER_ID,
+                message_id=message.message_id,
+                disable_notification=True,
+            )
+            logger.info("Đã tự động sao lưu và ghim database lên Telegram.")
+        except Exception as e:
+            logger.error("Lỗi khi tự động sao lưu database lên Telegram: %s", e)
 
     async def configure_profile(self, application: Application) -> None:
-        name = "MH - Dowsample Pro"
-        short_description = "Trợ lý thu thập, chuẩn hóa và phân loại mẫu âm thanh cho Minh Hiếu Producer."
+        # Khôi phục database từ tin nhắn ghim nếu có
+        try:
+            chat = await application.bot.get_chat(chat_id=ADMIN_USER_ID)
+            if chat.pinned_message and chat.pinned_message.document:
+                doc = chat.pinned_message.document
+                if doc.file_name == "access-control.db":
+                    file_id = doc.file_id
+                    file = await application.bot.get_file(file_id)
+                    ACCESS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    await file.download_to_drive(custom_path=ACCESS_DB_PATH)
+                    logger.info("Đã khôi phục thành công access-control.db từ tin nhắn ghim Telegram.")
+        except Exception as e:
+            logger.warning("Không thể tự động khôi phục database từ Telegram: %s", e)
+
+        name = "MH - Downsample Pro"
+        short_description = "Thu thập, chuẩn hóa và phân loại mẫu âm thanh dành cho người làm nhạc."
         description = (
-            "🎧 Trợ lý âm thanh riêng của Minh Hiếu Producer.\n\n"
-            "Anh chỉ cần gửi URL âm thanh hoặc liên kết từ một trang catalogue. Em sẽ tìm mẫu, "
-            "kiểm tra chất lượng, chuẩn hóa WAV, phân loại và lưu vào thư viện."
+            "🎧 Trợ lý xử lý mẫu âm thanh dành cho người làm nhạc Việt Nam.\n\n"
+            "Gửi một đường dẫn có âm thanh để hệ thống tìm mẫu, kiểm tra chất lượng, "
+            "chuẩn hóa, phân loại và gửi tệp kết quả ngay trên Telegram."
         )
-        commands = [
-            BotCommand("start", "Mở hướng dẫn sử dụng"),
-            BotCommand("stats", "Xem thống kê thư viện âm thanh"),
-            BotCommand("path", "Xem thư mục lưu âm thanh"),
-            BotCommand("dangnhap", "Đăng nhập website theo URL"),
-            BotCommand("organize", "Quét một thư mục trên máy"),
+        public_commands = [
+            BotCommand("batdau", "Mở hướng dẫn sử dụng"),
+            BotCommand("yeucau", "Gửi yêu cầu bằng mã mời"),
+            BotCommand("quyen", "Xem trạng thái quyền sử dụng"),
+            BotCommand("thongke", "Xem thống kê thư viện âm thanh"),
+        ]
+        admin_commands = [
+            *public_commands,
+            BotCommand("taoma", "Tạo mã mời dùng một lần"),
+            BotCommand("thumuc", "Xem nơi lưu âm thanh trên máy chủ"),
+            BotCommand("datthumuc", "Chọn nơi lưu sample trên máy chủ"),
+            BotCommand("sapxep", "Xử lý một thư mục trên máy chủ"),
         ]
         try:
             if (await application.bot.get_my_name()).name != name:
@@ -454,37 +1091,99 @@ class AudioBot:
                 await application.bot.set_my_short_description(short_description)
             if (await application.bot.get_my_description()).description != description:
                 await application.bot.set_my_description(description)
-            current_commands = await application.bot.get_my_commands()
-            current_values = [(item.command, item.description) for item in current_commands]
-            wanted_values = [(item.command, item.description) for item in commands]
-            if current_values != wanted_values:
-                await application.bot.set_my_commands(commands)
+            current_public_commands = await application.bot.get_my_commands()
+            current_public_values = [(item.command, item.description) for item in current_public_commands]
+            wanted_public_values = [(item.command, item.description) for item in public_commands]
+            if current_public_values != wanted_public_values:
+                await application.bot.set_my_commands(public_commands)
+
+            admin_scope = BotCommandScopeChat(chat_id=ADMIN_USER_ID)
+            current_admin_commands = await application.bot.get_my_commands(scope=admin_scope)
+            current_admin_values = [(item.command, item.description) for item in current_admin_commands]
+            wanted_admin_values = [(item.command, item.description) for item in admin_commands]
+            if current_admin_values != wanted_admin_values:
+                await application.bot.set_my_commands(admin_commands, scope=admin_scope)
+        except RetryAfter as exc:
+            retry_after = exc.retry_after
+            delay = retry_after.total_seconds() if isinstance(retry_after, timedelta) else float(retry_after)
+            logger.warning("Telegram tam gioi han cap nhat ho so; se thu lai sau %.0f giay", delay)
+            if not self.profile_retry_task or self.profile_retry_task.done():
+                self.profile_retry_task = asyncio.create_task(self._retry_profile(application, delay + 1))
         except TelegramError as exc:
-            logger.warning("Chưa thể đồng bộ hồ sơ Telegram; Bot vẫn tiếp tục chạy: %s", exc)
+            logger.warning("Chưa thể đồng bộ hồ sơ Telegram; trợ lý vẫn tiếp tục chạy: %s", exc)
+
+        # Khởi chạy Web Server để Render ping giúp Bot online 24/24
+        import os
+        from aiohttp import web
+
+        async def health_check(request):
+            return web.Response(text="OK")
+
+        async def start_web_server():
+            try:
+                app = web.Application()
+                app.router.add_get("/", health_check)
+                app.router.add_get("/health", health_check)
+                runner = web.AppRunner(app)
+                await runner.setup()
+                port = int(os.getenv("PORT", "8080"))
+                site = web.TCPSite(runner, "0.0.0.0", port)
+                await site.start()
+                logger.info("Web server started successfully on port %d", port)
+            except Exception as e:
+                logger.error("Failed to start health check web server: %s", e)
+
+        asyncio.create_task(start_web_server())
+
+    async def _retry_profile(self, application: Application, delay: float) -> None:
+        await asyncio.sleep(delay)
+        self.profile_retry_task = None
+        await self.configure_profile(application)
 
     async def shutdown(self, _application: Application) -> None:
-        if self.login_task and not self.login_task.done():
-            self.login_task.cancel()
-            await asyncio.gather(self.login_task, return_exceptions=True)
+        if self.profile_retry_task and not self.profile_retry_task.done():
+            self.profile_retry_task.cancel()
+            await asyncio.gather(self.profile_retry_task, return_exceptions=True)
         self.crawler.close()
         self.organizer.db.checkpoint()
         self.organizer.db.close_all()
+        self.access_control.checkpoint()
         cleanup_run(self.run_dir)
 
     def run(self) -> None:
         application = (
             Application.builder()
             .token(TELEGRAM_TOKEN)
+            .read_timeout(30)
+            .write_timeout(30)
+            .media_write_timeout(TELEGRAM_UPLOAD_TIMEOUT_SEC)
+            .connect_timeout(15)
+            .pool_timeout(30)
             .post_init(self.configure_profile)
             .post_shutdown(self.shutdown)
             .build()
         )
-        application.add_handler(CommandHandler("start", self.cmd_start))
-        application.add_handler(CommandHandler("stats", self.cmd_stats))
-        application.add_handler(CommandHandler("path", self.cmd_path))
-        application.add_handler(CommandHandler("dangnhap", self.cmd_login))
-        application.add_handler(CommandHandler("organize", self.cmd_organize))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_url))
+        application.add_handler(CommandHandler(["start", "batdau"], self.cmd_start))
+        application.add_handler(CommandHandler("yeucau", self.cmd_request_access))
+        application.add_handler(CommandHandler("quyen", self.cmd_access_status))
+        application.add_handler(CommandHandler("taoma", self.cmd_create_invite))
+        application.add_handler(CommandHandler(["stats", "thongke"], self.cmd_authorized_stats))
+        application.add_handler(CommandHandler(["path", "thumuc"], self.cmd_path))
+        application.add_handler(CommandHandler("datthumuc", self.cmd_set_output))
+        application.add_handler(CommandHandler(["organize", "sapxep"], self.cmd_organize))
+        application.add_handler(
+            CallbackQueryHandler(self.handle_access_callback, pattern=r"^access:")
+        )
+        application.add_handler(
+            CallbackQueryHandler(self.handle_authorized_menu, pattern=r"^menu:")
+        )
+        application.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self.handle_authorized_url,
+                block=False,
+            )
+        )
         application.run_polling()
 
 

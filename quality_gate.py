@@ -15,6 +15,7 @@ import requests
 
 from config import QUALITY
 from exceptions import AudioAnalysisError, HTTPError, NetworkError
+from utils.network import request_with_safe_redirects, validate_public_url
 
 ONSET_WEIGHT = 0.35
 REGULARITY_WEIGHT = 0.30
@@ -37,7 +38,13 @@ class QualityGate:
     def pre_download_ok(self, url: str, session: requests.Session | None = None) -> tuple[bool, str]:
         client = session or requests.Session()
         try:
-            response = client.head(url, allow_redirects=True, timeout=10)
+            response = request_with_safe_redirects(
+                client,
+                "HEAD",
+                url,
+                validator=validate_public_url,
+                timeout=10,
+            )
         except requests.RequestException as exc:
             raise NetworkError(str(exc)) from exc
         try:
@@ -50,11 +57,13 @@ class QualityGate:
             ):
                 response.close()
                 try:
-                    response = client.get(
+                    response = request_with_safe_redirects(
+                        client,
+                        "GET",
                         url,
+                        validator=validate_public_url,
                         headers={"Range": "bytes=0-0"},
                         stream=True,
-                        allow_redirects=True,
                         timeout=10,
                     )
                 except requests.RequestException as exc:

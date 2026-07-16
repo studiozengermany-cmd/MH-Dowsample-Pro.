@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
+import html as html_lib
+import json
 import os
 import re
-import socket
+import threading
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 
 import requests
-from playwright.async_api import BrowserContext, Page, Request, Response, async_playwright
+from playwright.async_api import BrowserContext, Request, Response, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -20,25 +21,29 @@ from config import (
     CRAWL_LAUNCH_TIMEOUT_MS,
     CRAWL_TIMEOUT_SEC,
     CRAWL_WAIT_SEC,
-    LOGIN_TIMEOUT_SEC,
     QUALITY,
     configure_playwright_runtime,
-    find_browser_executable,
 )
 from exceptions import (
-    AuthenticationRequiredError,
     BrowserUnavailableError,
+    CrawlLimitError,
     CrawlTimeoutError,
     FileTooLargeError,
     HTTPError,
     NetworkError,
-    PathTraversalError,
+    NoAudioFoundError,
 )
 from quality_gate import QualityGate
+from utils.network import request_with_safe_redirects, validate_public_url
 from utils.paths import safe_child, sanitize_filename
 from utils.retry import retry
 
 _AUDIO_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".aiff"}
+_MAX_SPLICE_PAGES = 50
+_SVELTEKIT_FETCHED_SCRIPT = re.compile(
+    r"<script\b[^>]*\bdata-sveltekit-fetched\b[^>]*>(.*?)</script>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 _CONTENT_TYPE_SUFFIXES = {
     "audio/mpeg": ".mp3",
     "audio/mp3": ".mp3",
@@ -58,20 +63,6 @@ def _is_audio_url(value: str) -> bool:
     if not value.startswith(("http://", "https://")):
         return False
     return Path(urlparse(value).path).suffix.lower() in _AUDIO_SUFFIXES
-
-
-def validate_public_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise PathTraversalError("Only absolute HTTP/HTTPS URLs are allowed")
-    try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)}
-    except socket.gaierror as exc:
-        raise NetworkError(f"Cannot resolve {parsed.hostname}") from exc
-    for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if not ip.is_global:
-            raise NetworkError(f"Private or non-global address is blocked: {ip}")
 
 
 def extract_audio_urls_from_payload(payload: object) -> list[str]:
@@ -136,38 +127,101 @@ def extract_splice_listed_sample_urls(payload: object) -> list[str]:
 
 
 def extract_splice_listed_samples(payload: object) -> list[tuple[str, str | None]]:
-    """Return playable URLs plus human titles when the catalogue exposes them."""
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data")
-    search = data.get("assetsSearch") if isinstance(data, dict) else None
-    items = search.get("items") if isinstance(search, dict) else None
-    if not isinstance(items, list):
-        return []
-
+    """Return playable URLs plus titles from any Splice catalogue response shape."""
     samples: list[tuple[str, str | None]] = []
-    for item in items:
-        files = item.get("files") if isinstance(item, dict) else None
-        if not isinstance(files, list):
-            continue
-        candidates = [
-            file
-            for file in files
-            if isinstance(file, dict)
-            and isinstance(file.get("url"), str)
-            and str(file["url"]).startswith(("http://", "https://"))
-            and Path(urlparse(str(file["url"])).path).suffix.lower() in _AUDIO_SUFFIXES
-        ]
-        preferred = next(
-            (file for file in candidates if file.get("asset_file_type_slug") == "preview_mp3"),
-            candidates[0] if candidates else None,
-        )
-        if preferred is not None:
-            url = str(preferred["url"])
-            title = _catalogue_title(item)
-            if all(existing_url != url for existing_url, _existing_title in samples):
-                samples.append((url, title))
+
+    def visit(value: object) -> None:
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, dict):
+            return
+
+        files = value.get("files")
+        if isinstance(files, list):
+            item = value
+            candidates = [
+                file
+                for file in files
+                if isinstance(file, dict)
+                and isinstance(file.get("url"), str)
+                and str(file["url"]).startswith(("http://", "https://"))
+                and Path(urlparse(str(file["url"])).path).suffix.lower() in _AUDIO_SUFFIXES
+            ]
+            preferred = next(
+                (file for file in candidates if file.get("asset_file_type_slug") == "preview_mp3"),
+                candidates[0] if candidates else None,
+            )
+            if preferred is not None:
+                url = str(preferred["url"])
+                title = _catalogue_title(item)
+                if all(existing_url != url for existing_url, _existing_title in samples):
+                    samples.append((url, title))
+
+        for child in value.values():
+            visit(child)
+
+    visit(payload)
     return samples
+
+
+def extract_splice_page_assets(document: str) -> tuple[list[tuple[str, str | None]], int, int]:
+    """Read public preset previews and pagination from Splice's server-rendered HTML."""
+    assets: list[tuple[str, str | None]] = []
+    current_page = 1
+    total_pages = 1
+
+    def add(items: list[tuple[str, str | None]]) -> None:
+        for url, title in items:
+            if all(existing_url != url for existing_url, _existing_title in assets):
+                assets.append((url, title))
+
+    def visit_metadata(value: object) -> None:
+        nonlocal current_page, total_pages
+        if isinstance(value, list):
+            for child in value:
+                visit_metadata(child)
+            return
+        if not isinstance(value, dict):
+            return
+        metadata = value.get("pagination_metadata")
+        if isinstance(metadata, dict):
+            try:
+                current_page = max(1, int(metadata.get("currentPage") or current_page))
+                total_pages = max(current_page, int(metadata.get("totalPages") or total_pages))
+            except (TypeError, ValueError):
+                pass
+        for child in value.values():
+            visit_metadata(child)
+
+    for match in _SVELTEKIT_FETCHED_SCRIPT.finditer(document):
+        try:
+            envelope = json.loads(html_lib.unescape(match.group(1)).strip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        body = envelope.get("body") if isinstance(envelope, dict) else None
+        try:
+            payload = json.loads(body) if isinstance(body, str) else body
+        except json.JSONDecodeError:
+            continue
+        listed = extract_splice_listed_samples(payload)
+        add(listed)
+        visit_metadata(payload)
+
+    if assets:
+        return assets, current_page, total_pages
+
+    # Retain a guarded fallback for future server-rendering changes where the
+    # response body is no longer wrapped by data-sveltekit-fetched.
+    normalized = html_lib.unescape(document).replace(r"\/", "/").replace(r"\u0026", "&")
+    for raw_url in re.findall(r"https?://[^\s\"'<>\\]+", normalized):
+        url = raw_url.rstrip(".,);]")
+        if not _is_audio_url(url):
+            continue
+        title = unquote(Path(urlparse(url).path).stem) or None
+        add([(url, title)])
+    return assets, current_page, total_pages
 
 
 def _catalogue_title(item: object) -> str | None:
@@ -211,13 +265,8 @@ class AudioCrawler:
         self.session = session or requests.Session()
         self.session.headers.setdefault("User-Agent", self._USER_AGENT)
         self.profile_dir = BROWSER_PROFILE_DIR
-        self.browser_executable = find_browser_executable()
         self._browser_lock = asyncio.Lock()
         self.discovered_titles: dict[str, str] = {}
-
-    @property
-    def interactive_login_supported(self) -> bool:
-        return self.browser_executable is not None
 
     async def sniff_urls(self, page_url: str) -> list[str]:
         validate_public_url(page_url)
@@ -225,10 +274,15 @@ class AudioCrawler:
             self.discovered_titles.clear()
             self.discovered_titles[page_url] = unquote(Path(urlparse(page_url).path).stem)
             return [page_url]
+        self.discovered_titles.clear()
         try:
-            return await asyncio.wait_for(self._sniff_urls(page_url), timeout=CRAWL_TIMEOUT_SEC)
+            urls = await self._discover_urls(page_url)
+            if not urls:
+                hostname = urlparse(page_url).hostname or "unknown"
+                raise NoAudioFoundError(f"No public audio assets were discovered on {hostname}")
+            return urls
         except TimeoutError as exc:
-            raise CrawlTimeoutError(f"Browser crawl timed out after {CRAWL_TIMEOUT_SEC:g} seconds") from exc
+            raise CrawlTimeoutError(f"Crawl timed out after {CRAWL_TIMEOUT_SEC:g} seconds") from exc
         except PlaywrightTimeoutError as exc:
             raise CrawlTimeoutError("The page did not become ready in time") from exc
         except PlaywrightError as exc:
@@ -239,6 +293,97 @@ class AudioCrawler:
                     "python -m playwright install chromium --only-shell"
                 ) from exc
             raise BrowserUnavailableError(f"Playwright browser failed: {message}") from exc
+
+    async def _discover_urls(self, page_url: str) -> list[str]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CRAWL_TIMEOUT_SEC
+        if self._is_splice_url(page_url):
+            stop = threading.Event()
+            worker = asyncio.create_task(asyncio.to_thread(self._discover_splice_pages, page_url, stop))
+            try:
+                assets = await asyncio.wait_for(asyncio.shield(worker), timeout=CRAWL_TIMEOUT_SEC)
+            except (TimeoutError, asyncio.CancelledError):
+                stop.set()
+                try:
+                    await worker
+                except Exception:
+                    pass
+                raise
+            if assets:
+                for url, title in assets:
+                    if title:
+                        self.discovered_titles.setdefault(url, title)
+                return [url for url, _title in assets]
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError
+        return await asyncio.wait_for(self._sniff_urls(page_url), timeout=remaining)
+
+    def _discover_splice_pages(
+        self,
+        page_url: str,
+        stop: threading.Event | None = None,
+    ) -> list[tuple[str, str | None]]:
+        """Collect every bounded public Splice preview page without driving its UI."""
+        stop = stop or threading.Event()
+        assets: list[tuple[str, str | None]] = []
+        seen_urls: set[str] = set()
+        with requests.Session() as client:
+            client.headers.update({"User-Agent": self._USER_AGENT})
+            first_document = self._fetch_splice_page(client, page_url)
+            first_assets, current_page, total_pages = extract_splice_page_assets(first_document)
+
+            def add(items: list[tuple[str, str | None]]) -> None:
+                for url, title in items:
+                    if url not in seen_urls:
+                        assets.append((url, title))
+                        seen_urls.add(url)
+
+            add(first_assets)
+            total_pages = max(total_pages, current_page)
+            if total_pages > _MAX_SPLICE_PAGES:
+                raise CrawlLimitError(
+                    f"Splice catalogue has {total_pages} pages; safe limit is {_MAX_SPLICE_PAGES}"
+                )
+            for page_number in range(1, total_pages + 1):
+                if stop.is_set():
+                    return []
+                if page_number == current_page:
+                    continue
+                document = self._fetch_splice_page(client, self._with_page(page_url, page_number))
+                page_assets, _current, _total = extract_splice_page_assets(document)
+                add(page_assets)
+        return assets
+
+    @retry(
+        attempts=3,
+        delay=2.0,
+        exceptions=(requests.Timeout, requests.ConnectionError, NetworkError),
+    )
+    def _fetch_splice_page(self, client: requests.Session, page_url: str) -> str:
+        try:
+            response = request_with_safe_redirects(
+                client,
+                "GET",
+                page_url,
+                validator=validate_public_url,
+                timeout=(10, 30),
+            )
+        except requests.RequestException as exc:
+            raise NetworkError(str(exc)) from exc
+        try:
+            if response.status_code >= 400:
+                raise HTTPError(response.status_code)
+            return response.text
+        finally:
+            response.close()
+
+    @staticmethod
+    def _with_page(page_url: str, page_number: int) -> str:
+        parsed = urlparse(page_url)
+        query = [(key, value) for key, value in parse_qsl(parsed.query) if key != "page"]
+        query.append(("page", str(page_number)))
+        return parsed._replace(query=urlencode(query)).geturl()
 
     async def _sniff_urls(self, page_url: str) -> list[str]:
         found: set[str] = set()
@@ -289,11 +434,13 @@ class AudioCrawler:
                             listed_samples.add(url)
                             if title:
                                 self.discovered_titles.setdefault(url, title)
-                    else:
-                        for url, title in extract_audio_assets_from_payload(payload):
-                            found.add(url)
-                            if title:
-                                self.discovered_titles.setdefault(url, title)
+                    # Keep a generic fallback even for Splice. Its catalogue API has
+                    # changed wrappers before, and a valid preview must not disappear
+                    # merely because it was not nested below assetsSearch.items.
+                    for url, title in extract_audio_assets_from_payload(payload):
+                        found.add(url)
+                        if title:
+                            self.discovered_titles.setdefault(url, title)
 
                 async def inspect_dom() -> None:
                     selector = ", ".join(
@@ -367,7 +514,9 @@ class AudioCrawler:
 
                 page.on("request", inspect_request)
                 page.on("response", inspect_all)
-                await page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+                navigation = await page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+                if navigation is not None and navigation.status >= 400:
+                    raise HTTPError(navigation.status)
                 ready = page.locator(
                     'a[href*="/accounts/sign-in"], button[aria-label*="play" i], '
                     "audio, source[src], [data-audio-url], [data-audio-src], "
@@ -379,8 +528,6 @@ class AudioCrawler:
                     await page.wait_for_timeout(1_000)
                 await drain_response_tasks()
                 await inspect_dom()
-                if self._is_splice_url(page_url) and await self._splice_requires_login(page):
-                    raise AuthenticationRequiredError("Splice requires an authenticated browser session")
                 if listed_samples:
                     await self._sync_browser_session(context, page_url)
                     return sorted(listed_samples)
@@ -433,6 +580,9 @@ class AudioCrawler:
                 await page.wait_for_timeout(int(CRAWL_WAIT_SEC * 1000))
                 await drain_response_tasks()
                 await inspect_dom()
+                if listed_samples:
+                    await self._sync_browser_session(context, page_url)
+                    return sorted(listed_samples)
                 await self._sync_browser_session(context, page_url)
             finally:
                 await context.close()
@@ -449,111 +599,10 @@ class AudioCrawler:
             )
         self.session.headers["Referer"] = page_url
 
-    async def login_site(self, site_url: str, timeout_sec: float = LOGIN_TIMEOUT_SEC) -> bool:
-        validate_public_url(site_url)
-        if not self.browser_executable:
-            raise BrowserUnavailableError("No interactive Chromium-based browser is installed")
-        async with self._browser_lock:
-            self.profile_dir.mkdir(parents=True, exist_ok=True)
-            process = await asyncio.create_subprocess_exec(
-                str(self.browser_executable),
-                f"--user-data-dir={self.profile_dir.resolve()}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--new-window",
-                site_url,
-            )
-            try:
-                await asyncio.wait_for(process.wait(), timeout=timeout_sec)
-                if self._is_splice_url(site_url):
-                    return await self._verify_splice_session()
-                return await self._verify_site_session(site_url)
-            except TimeoutError:
-                try:
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except (ProcessLookupError, TimeoutError):
-                    process.kill()
-                    await process.wait()
-                return False
-            except asyncio.CancelledError:
-                try:
-                    process.terminate()
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except (ProcessLookupError, TimeoutError):
-                    process.kill()
-                    await process.wait()
-                raise
-
-    async def login_splice(self, timeout_sec: float = LOGIN_TIMEOUT_SEC) -> bool:
-        """Compatibility wrapper for existing callers."""
-        return await self.login_site("https://splice.com/accounts/sign-in", timeout_sec)
-
-    async def _verify_site_session(self, site_url: str) -> bool:
-        """Verify that the persisted browser profile can reopen a generic site."""
-        try:
-            async with async_playwright() as playwright:
-                context = await playwright.chromium.launch_persistent_context(
-                    self.profile_dir,
-                    headless=True,
-                    timeout=CRAWL_LAUNCH_TIMEOUT_MS,
-                    user_agent=self._USER_AGENT,
-                    args=["--no-first-run", "--no-default-browser-check"],
-                )
-                try:
-                    page = context.pages[0] if context.pages else await context.new_page()
-                    response = await page.goto(site_url, wait_until="commit", timeout=20_000)
-                    await self._sync_browser_session(context, site_url)
-                    return response is not None and response.status < 400
-                finally:
-                    await context.close()
-        except PlaywrightError:
-            return False
-
-    async def _verify_splice_session(self) -> bool:
-        """Require positive authenticated UI evidence; never infer success from a closed window."""
-        try:
-            async with async_playwright() as playwright:
-                context = await playwright.chromium.launch_persistent_context(
-                    self.profile_dir,
-                    headless=True,
-                    timeout=CRAWL_LAUNCH_TIMEOUT_MS,
-                    user_agent=self._USER_AGENT,
-                    args=["--no-first-run", "--no-default-browser-check"],
-                )
-                try:
-                    page = context.pages[0] if context.pages else await context.new_page()
-                    await page.goto(
-                        "https://splice.com/sounds/genres/drum-and-bass/samples",
-                        wait_until="commit",
-                        timeout=20_000,
-                    )
-                    login_link = page.locator('a[href*="/accounts/sign-in"]')
-                    play_buttons = page.locator('button[aria-label="play sample"]')
-                    for _attempt in range(20):
-                        if await login_link.count():
-                            return False
-                        buttons = await play_buttons.all()
-                        for button in buttons[:5]:
-                            if await button.is_visible():
-                                return True
-                        await page.wait_for_timeout(1_000)
-                    return False
-                finally:
-                    await context.close()
-        except PlaywrightError:
-            return False
-
     @staticmethod
     def _is_splice_url(url: str) -> bool:
         hostname = (urlparse(url).hostname or "").lower()
         return hostname == "splice.com" or hostname.endswith(".splice.com")
-
-    @staticmethod
-    async def _splice_requires_login(page: Page) -> bool:
-        if urlparse(page.url).path.startswith("/accounts/sign-in"):
-            return True
-        return await page.locator('a[href*="/accounts/sign-in"]').count() > 0
 
     @retry(attempts=3, delay=0.5, exceptions=(requests.Timeout, requests.ConnectionError, NetworkError))
     def download(
@@ -569,13 +618,17 @@ class AudioCrawler:
             if not ok:
                 return None
             try:
-                response = client.get(url, stream=True, allow_redirects=True, timeout=(10, 60))
+                response = request_with_safe_redirects(
+                    client,
+                    "GET",
+                    url,
+                    validator=validate_public_url,
+                    stream=True,
+                    timeout=(10, 60),
+                )
             except requests.RequestException as exc:
                 raise NetworkError(str(exc)) from exc
             try:
-                for item in response.history:
-                    validate_public_url(item.headers.get("Location", item.url))
-                validate_public_url(response.url)
                 if response.status_code >= 400:
                     raise HTTPError(response.status_code)
                 raw = self._response_filename(response, url)
@@ -631,8 +684,12 @@ class AudioCrawler:
         marker = "filename="
         if marker in disposition.lower():
             value = disposition.split("=", 1)[1].strip().strip("\"'")
-            return unquote(value)
-        return unquote(Path(urlparse(url).path).name) or "download.bin"
+            # Some CDNs include a catalogue folder in filename= (for example
+            # "20918/demo.mp3").  A server-provided filename must never create
+            # directories locally, so retain only its final path component.
+            return unquote(value).replace("\\", "/").rsplit("/", 1)[-1] or "download.bin"
+        decoded_path = unquote(urlparse(url).path).replace("\\", "/")
+        return decoded_path.rsplit("/", 1)[-1] or "download.bin"
 
     @staticmethod
     def _available_path(target: Path) -> Path:

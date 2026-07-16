@@ -1,24 +1,28 @@
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import requests
 
 import crawler
+import utils.network
 from crawler import (
     AudioCrawler,
     extract_audio_assets_from_payload,
     extract_audio_urls_from_payload,
     extract_splice_listed_sample_urls,
     extract_splice_listed_samples,
+    extract_splice_page_assets,
 )
-from exceptions import CrawlTimeoutError, FileTooLargeError, NetworkError
+from exceptions import CrawlLimitError, CrawlTimeoutError, FileTooLargeError, NetworkError, NoAudioFoundError
 
 
 def test_blocks_private_address(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        crawler.socket, "getaddrinfo", lambda *args: [(None, None, None, None, ("127.0.0.1", 80))]
+        utils.network.socket, "getaddrinfo", lambda *args: [(None, None, None, None, ("127.0.0.1", 80))]
     )
     with pytest.raises(NetworkError):
         crawler.validate_public_url("http://example.test/audio.wav")
@@ -115,6 +119,140 @@ def test_splice_extractor_returns_one_playable_file_per_listed_sample() -> None:
     )
 
 
+def test_splice_extractor_tolerates_changed_catalogue_wrapper() -> None:
+    payload = {
+        "data": {
+            "packPresets": {
+                "edges": [
+                    {
+                        "node": {
+                            "name": "Airy Preset",
+                            "files": [
+                                {
+                                    "asset_file_type_slug": "preview_mp3",
+                                    "url": "https://cdn.test/airy.mp3",
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    assert extract_splice_listed_samples(payload) == [
+        ("https://cdn.test/airy.mp3", "Airy Preset")
+    ]
+
+
+def _splice_document(name: str, url: str, page: int, total_pages: int) -> str:
+    payload = {
+        "data": {
+            "assetsSearch": {
+                "items": [
+                    {
+                        "name": name,
+                        "files": [
+                            {
+                                "asset_file_type_slug": "preview_mp3",
+                                "url": url,
+                            }
+                        ],
+                    }
+                ],
+                "pagination_metadata": {"currentPage": page, "totalPages": total_pages},
+            }
+        }
+    }
+    envelope = {"status": 200, "body": json.dumps(payload)}
+    return (
+        '<script type="application/json" data-sveltekit-fetched '
+        f'data-url="https://surfaces-graphql.splice.com/graphql">{json.dumps(envelope)}</script>'
+    )
+
+
+def test_extracts_public_splice_previews_from_server_rendered_html() -> None:
+    document = _splice_document("Warm Pad", "https://cdn.test/warm-pad.mp3", 2, 5)
+
+    assets, current_page, total_pages = extract_splice_page_assets(document)
+
+    assert assets == [("https://cdn.test/warm-pad.mp3", "Warm Pad")]
+    assert (current_page, total_pages) == (2, 5)
+
+
+def test_splice_page_keeps_preset_and_regular_assets() -> None:
+    preset = _splice_document(
+        "Preset",
+        "https://cdn.test/premium_presets/previews/preset.mp3",
+        1,
+        1,
+    )
+    regular = _splice_document("Sample", "https://cdn.test/samples/sample.mp3", 1, 1)
+
+    assets, _current_page, _total_pages = extract_splice_page_assets(preset + regular)
+
+    assert assets == [
+        ("https://cdn.test/premium_presets/previews/preset.mp3", "Preset"),
+        ("https://cdn.test/samples/sample.mp3", "Sample"),
+    ]
+
+
+def test_splice_html_discovery_rejects_catalogue_above_safe_page_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = AudioCrawler(tmp_path)
+    page_url = "https://splice.com/sounds/packs/vendor/pack/presets"
+    document = _splice_document("First", "https://cdn.test/first.mp3", 1, 51)
+    monkeypatch.setattr(instance, "_fetch_splice_page", lambda _client, _url: document)
+
+    with pytest.raises(CrawlLimitError, match="51 pages"):
+        instance._discover_splice_pages(page_url)
+
+    instance.close()
+
+
+def test_splice_html_discovery_collects_every_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = AudioCrawler(tmp_path)
+    page_url = "https://splice.com/sounds/packs/vendor/pack/presets"
+    documents = {
+        page_url: _splice_document("First", "https://cdn.test/first.mp3", 1, 2),
+        f"{page_url}?page=2": _splice_document("Second", "https://cdn.test/second.mp3", 2, 2),
+    }
+    monkeypatch.setattr(instance, "_fetch_splice_page", lambda _client, url: documents[url])
+
+    assets = instance._discover_splice_pages(page_url)
+
+    assert assets == [
+        ("https://cdn.test/first.mp3", "First"),
+        ("https://cdn.test/second.mp3", "Second"),
+    ]
+    instance.close()
+
+
+async def test_splice_uses_public_html_before_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = AudioCrawler(tmp_path)
+    page_url = "https://splice.com/sounds/packs/vendor/pack/presets"
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
+    monkeypatch.setattr(
+        instance,
+        "_discover_splice_pages",
+        lambda _url, _stop=None: [("https://cdn.test/public.mp3", "Public Preview")],
+    )
+
+    async def browser_must_not_run(_url: str) -> list[str]:
+        raise AssertionError("browser fallback should not run")
+
+    monkeypatch.setattr(instance, "_sniff_urls", browser_must_not_run)
+
+    assert await instance.sniff_urls(page_url) == ["https://cdn.test/public.mp3"]
+    assert instance.discovered_titles == {"https://cdn.test/public.mp3": "Public Preview"}
+    instance.close()
+
+
 async def test_browser_crawl_has_a_hard_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     instance = AudioCrawler(tmp_path)
 
@@ -128,6 +266,23 @@ async def test_browser_crawl_has_a_hard_timeout(tmp_path: Path, monkeypatch: pyt
 
     with pytest.raises(CrawlTimeoutError, match="timed out"):
         await instance.sniff_urls("https://example.com")
+    instance.close()
+
+
+async def test_empty_browser_discovery_is_a_typed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = AudioCrawler(tmp_path)
+
+    async def returns_empty(_url: str) -> list[str]:
+        return []
+
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
+    monkeypatch.setattr(instance, "_sniff_urls", returns_empty)
+
+    with pytest.raises(NoAudioFoundError, match="example.com"):
+        await instance.sniff_urls("https://example.com/catalogue")
+
     instance.close()
 
 
@@ -170,6 +325,41 @@ def test_download_successful_saves_file(tmp_path: Path, monkeypatch: pytest.Monk
     assert result.read_bytes() == b"data"
 
 
+def test_relative_redirect_is_resolved_before_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = SimpleNamespace(pre_download_ok=lambda *_args: (True, "ok"))
+    first = SimpleNamespace(
+        status_code=302,
+        headers={"Location": "/audio.wav"},
+        url="https://example.com/start",
+        close=Mock(),
+    )
+    final = SimpleNamespace(
+        status_code=200,
+        headers={},
+        history=[],
+        url="https://example.com/audio.wav",
+        iter_content=lambda _size: iter([b"audio"]),
+        close=Mock(),
+    )
+    requested: list[str] = []
+
+    def get(url, **_kwargs):
+        requested.append(url)
+        return first if len(requested) == 1 else final
+
+    session = SimpleNamespace(get=get, close=lambda: None, headers={})
+    instance = AudioCrawler(tmp_path, gate=gate, session=session)
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
+
+    result = instance.download("https://example.com/start")
+
+    assert result is not None
+    assert requested == ["https://example.com/start", "https://example.com/audio.wav"]
+    first.close.assert_called_once()
+
+
 def test_download_redirect_chain_validated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     gate = SimpleNamespace(pre_download_ok=lambda *_args: (True, "ok"))
 
@@ -179,16 +369,12 @@ def test_download_redirect_chain_validated(tmp_path: Path, monkeypatch: pytest.M
             return [(None, None, None, None, ("192.168.1.1", 80))]
         return [(None, None, None, None, ("8.8.8.8", 80))]
 
-    monkeypatch.setattr(crawler.socket, "getaddrinfo", mock_getaddrinfo)
+    monkeypatch.setattr(utils.network.socket, "getaddrinfo", mock_getaddrinfo)
 
-    history_mock = [
-        SimpleNamespace(url="http://example.com", headers={"Location": "http://private.internal/audio.wav"})
-    ]
     response = SimpleNamespace(
-        status_code=200,
-        headers={},
-        history=history_mock,
-        url="http://private.internal/audio.wav",
+        status_code=302,
+        headers={"Location": "http://private.internal/audio.wav"},
+        url="http://example.com/audio.wav",
         close=lambda: None,
     )
     session = SimpleNamespace(get=lambda *args, **kwargs: response, close=lambda: None, headers={})
@@ -244,6 +430,53 @@ def test_filename_from_content_disposition(tmp_path: Path, monkeypatch: pytest.M
     result = instance.download("https://example.com/download?id=123")
     assert result is not None
     assert result.name == "custom_name.wav"
+
+
+def test_content_disposition_catalogue_path_uses_only_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = SimpleNamespace(pre_download_ok=lambda *_args: (True, "ok"))
+    response = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Disposition": 'attachment; filename="20918/Indie_Tech_House_Demo.mp3"'},
+        history=[],
+        url="https://cdn.example.com/20918/Indie_Tech_House_Demo.mp3",
+        iter_content=lambda _size: iter([b"audio-data"]),
+        close=lambda: None,
+    )
+    session = SimpleNamespace(get=lambda *args, **kwargs: response, close=lambda: None, headers={})
+    instance = AudioCrawler(tmp_path, gate=gate, session=session)
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
+
+    result = instance.download(response.url)
+
+    assert result is not None
+    assert result.name == "Indie_Tech_House_Demo.mp3"
+    assert result.parent == tmp_path
+
+
+def test_encoded_url_path_separator_uses_only_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = SimpleNamespace(pre_download_ok=lambda *_args: (True, "ok"))
+    url = "https://cdn.example.com/20918%2FIndie_Tech_House_Demo.mp3"
+    response = SimpleNamespace(
+        status_code=200,
+        headers={},
+        history=[],
+        url=url,
+        iter_content=lambda _size: iter([b"audio-data"]),
+        close=lambda: None,
+    )
+    session = SimpleNamespace(get=lambda *args, **kwargs: response, close=lambda: None, headers={})
+    instance = AudioCrawler(tmp_path, gate=gate, session=session)
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
+
+    result = instance.download(url)
+
+    assert result is not None
+    assert result.name == "Indie_Tech_House_Demo.mp3"
+    assert result.parent == tmp_path
 
 
 def test_suggested_name_replaces_opaque_cdn_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2,8 +2,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from quality_gate import QualityGate
+
+
+@pytest.fixture(autouse=True)
+def _use_mock_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    def request(client, method, url, **kwargs):
+        kwargs.pop("validator", None)
+        return getattr(client, method.lower())(url, **kwargs)
+
+    monkeypatch.setattr("quality_gate.request_with_safe_redirects", request)
 
 
 def test_pcm_wav_bitrate_is_calculated(full_band_wav: Path, monkeypatch) -> None:

@@ -75,7 +75,13 @@ def process_file(
     try:
         source_hash = organizer.hash_file(path)
         if organizer.is_duplicate(source_hash):
-            return {"status": "duplicate", "file": str(path), "source_hash": source_hash}
+            existing = organizer.metadata_for_hash(source_hash) or {}
+            return {
+                "status": "duplicate",
+                "file": str(path),
+                "output": existing.get("filepath"),
+                "source_hash": source_hash,
+            }
         analysis = gate.analyze(path)
         if not analysis["passed"]:
             if ephemeral and path.resolve().is_relative_to(staging_dir.resolve()):

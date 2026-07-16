@@ -57,7 +57,11 @@ class BrowserUnavailableError(CrawlerError):
     pass
 
 
-class AuthenticationRequiredError(CrawlerError):
+class NoAudioFoundError(CrawlerError):
+    pass
+
+
+class CrawlLimitError(CrawlerError):
     pass
 
 
