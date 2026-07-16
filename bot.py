@@ -36,6 +36,7 @@ from telegram.ext import (
 from access_control import AccessControlStore, AccessStatus, RequestOutcome
 from config import (
     ADMIN_USER_ID,
+    AUDIO_EXTS,
     BASE_DIR,
     DATA_DIR,
     DB_PATH,
@@ -849,6 +850,73 @@ class AudioBot:
             is_owner=False,
         )
 
+    async def cmd_assign_retry(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Let the admin recover a pre-manifest library for one explicit customer."""
+        if not self._is_admin(update):
+            return
+        if not context.args:
+            await send_chunked(
+                update,
+                "⚠️ Nhập Telegram ID của khách. Ví dụ: <code>/ganjob 123456789</code>",
+            )
+            return
+        try:
+            target_id = int(context.args[0])
+        except (TypeError, ValueError):
+            await send_chunked(update, "❌ Telegram ID không hợp lệ.")
+            return
+        if target_id <= 0:
+            await send_chunked(update, "❌ Telegram ID phải là số dương.")
+            return
+        if (
+            target_id != ADMIN_USER_ID
+            and self.access_control.status_for(target_id) is not AccessStatus.APPROVED
+        ):
+            await send_chunked(
+                update,
+                "❌ Tài khoản đích chưa được duyệt. Bot chưa gán file.",
+            )
+            return
+
+        try:
+            paths = sorted(
+                (
+                    path
+                    for path in self.output_dir.rglob("*")
+                    if path.is_file() and path.suffix.lower() in AUDIO_EXTS
+                ),
+                key=lambda path: path.as_posix().lower(),
+            )
+        except OSError:
+            logger.exception("Không thể quét thư viện để cứu job cũ")
+            await send_chunked(update, "❌ Không thể đọc thư viện hiện tại.")
+            return
+        if not paths:
+            await send_chunked(update, "⚠️ Thư viện hiện tại không còn file audio.")
+            return
+
+        results = [{"status": "passed", "output": str(path)} for path in paths]
+        try:
+            saved = self.delivery_retry_store.save(
+                target_id,
+                "library-recovery",
+                results,
+                self.output_dir,
+            )
+        except Exception:
+            logger.exception("Không thể gán job cũ cho Telegram ID %s", target_id)
+            await send_chunked(update, "❌ Chưa thể lưu manifest cứu hộ.")
+            return
+        await send_chunked(
+            update,
+            "✅ <b>ĐÃ GÁN JOB CŨ CHO KHÁCH</b>\n\n"
+            f"• Telegram ID: <code>{target_id}</code>\n"
+            f"• Số file: <b>{saved}</b>\n\n"
+            "Khách gửi <code>/taigoi</code> để nhận file.",
+        )
+
     def _delivery_service(self, *, owner_mode: str | None = None) -> DeliveryService:
         return DeliveryService(
             output_root=self.output_dir,
@@ -1174,6 +1242,7 @@ class AudioBot:
             BotCommand("thumuc", "Xem nơi lưu âm thanh trên máy chủ"),
             BotCommand("datthumuc", "Chọn nơi lưu sample trên máy chủ"),
             BotCommand("sapxep", "Xử lý một thư mục trên máy chủ"),
+            BotCommand("ganjob", "Gán job cũ cho đúng khách"),
         ]
         try:
             if (await application.bot.get_my_name()).name != name:
@@ -1264,6 +1333,7 @@ class AudioBot:
         application.add_handler(CommandHandler("datthumuc", self.cmd_set_output))
         application.add_handler(CommandHandler(["organize", "sapxep"], self.cmd_organize))
         application.add_handler(CommandHandler("taigoi", self.cmd_retry_delivery))
+        application.add_handler(CommandHandler("ganjob", self.cmd_assign_retry))
         application.add_handler(
             CallbackQueryHandler(self.handle_access_callback, pattern=r"^access:")
         )

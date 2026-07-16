@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from telegram.error import TelegramError, TimedOut
 
+from access_control import AccessStatus
 from bot import (
     AudioBot,
     build_result_archive,
@@ -387,6 +388,39 @@ async def test_approved_user_can_retry_existing_library_without_reprocessing(tmp
     assert first.read_bytes() == b"RIFF-first"
     assert second.read_bytes() == b"RIFF-second"
     assert not list((tmp_path / "run").glob("*.zip"))
+
+
+@pytest.mark.asyncio
+async def test_admin_can_assign_pre_manifest_library_to_one_approved_customer(
+    tmp_path,
+) -> None:
+    output_root = tmp_path / "organized"
+    sample = output_root / "Loops" / "sample.wav"
+    sample.parent.mkdir(parents=True)
+    sample.write_bytes(b"RIFF-sample")
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=42),
+        effective_message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    bot = AudioBot.__new__(AudioBot)
+    bot.output_dir = output_root
+    bot.access_control = SimpleNamespace(
+        status_for=lambda user_id: AccessStatus.APPROVED
+        if user_id == 77
+        else AccessStatus.PENDING
+    )
+    bot.delivery_retry_store = DeliveryRetryStore(tmp_path / "delivery-retries.db")
+
+    with patch("bot.ADMIN_USER_ID", 42):
+        await bot.cmd_assign_retry(update, SimpleNamespace(args=["77"]))
+
+    record = bot.delivery_retry_store.load(77, output_root)
+    assert record is not None
+    assert record.site == "library-recovery"
+    assert record.results == (
+        {"status": "passed", "output": str(sample.resolve())},
+    )
+    assert "ĐÃ GÁN JOB CŨ CHO KHÁCH" in update.effective_message.reply_text.await_args.args[0]
 
 
 @pytest.mark.asyncio
