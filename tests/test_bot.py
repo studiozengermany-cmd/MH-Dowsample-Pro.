@@ -1,11 +1,13 @@
 import asyncio
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from telegram.error import TelegramError, TimedOut
 
+from access_control import AccessStatus
 from bot import (
     AudioBot,
     build_result_archive,
@@ -23,6 +25,7 @@ from bot import (
     main_menu,
     source_name_from_url,
 )
+from delivery_retry import DeliveryRetryStore
 from exceptions import (
     CrawlLimitError,
     CrawlTimeoutError,
@@ -90,8 +93,8 @@ def test_progress_marks_completed_steps_and_only_current_step_as_pending() -> No
     assert "⏳ Đang tải tệp gốc: 2/5" in downloading
     assert "✅ <b>Đã tải tệp gốc:</b> 4" in analyzing
     assert "⏳ Đang kiểm tra và phân loại: 1/4" in analyzing
-    assert "✅ <b>Đã kiểm tra và phân loại:</b> 4" in completed
-    assert "✅ <b>Hoàn tất xử lý</b>" in completed
+    assert "✅ <b>Đã gửi file gốc:</b> 4" in completed
+    assert "✅ <b>Hoàn tất</b>" in completed
 
 
 def test_failed_progress_keeps_received_step_and_marks_failure() -> None:
@@ -130,7 +133,8 @@ def test_public_welcome_is_clear_and_does_not_expose_host_tools() -> None:
     assert "MH - DOWNSAMPLE PRO" in message
     assert "<b>CÁCH SỬ DỤNG</b>" in message
     assert "Bot tự tìm và tải" in message
-    assert "kiểm tra chất lượng" in message
+    assert "giữ tên file nguồn" in message
+    assert "ZIP dưới 20 MB" in message
     assert "đăng nhập" not in message.lower()
     assert "/batdau" not in message
     assert "/thumuc" not in message
@@ -143,7 +147,7 @@ def test_usage_guide_explains_one_linear_journey() -> None:
     assert "Dạ, anh/chị" in message
     assert "Sao chép liên kết" in message
     assert "Dán liên kết" in message
-    assert "gửi lại tệp kết quả" in message
+    assert "giữ file gốc" in message
     assert "TRỢ LÝ SẼ TỰ ĐỘNG" not in message
 
 
@@ -154,6 +158,9 @@ def test_admin_actions_are_buttons_not_welcome_text() -> None:
     assert "📁 Xử lý thư mục" not in public_labels
     assert admin_labels[0] == "🔗 Gửi liên kết âm thanh"
     assert "📁 Xử lý thư mục" in admin_labels
+    assert "🔑 Tạo mã mời" in admin_labels
+    assert "👥 Xét duyệt người dùng" in admin_labels
+    assert "🔑 Tạo mã mời" not in public_labels
     assert all("Đăng nhập" not in label for label in public_labels + admin_labels)
 
 
@@ -163,9 +170,35 @@ def test_admin_welcome_explains_the_automatic_pipeline() -> None:
     assert "nhiều trang khác nhau" in message
     assert "không cần chọn trước một nền tảng cố định" in message
     assert "Bot tự tìm và tải" in message
-    assert "chuẩn hóa và phân loại" in message
+    assert "giữ tên file nguồn" in message
+    assert "gửi ngay rồi mới tải lô tiếp theo" in message
     assert "đăng nhập" not in message.lower()
     assert "Splice" not in message
+
+
+@pytest.mark.asyncio
+async def test_admin_invite_button_creates_code_and_shows_share_command() -> None:
+    query = SimpleNamespace(
+        data="menu:tao_ma",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=999),
+        callback_query=query,
+    )
+    bot = AudioBot.__new__(AudioBot)
+    bot.access_control = SimpleNamespace(create_invite=Mock(return_value="ABCD-1234"))
+    bot.backup_database_to_telegram = AsyncMock()
+    context = SimpleNamespace(bot=SimpleNamespace())
+
+    with patch("bot.ADMIN_USER_ID", 999):
+        await bot.handle_menu(update, context)
+
+    response = query.edit_message_text.await_args.args[0]
+    assert "ABCD-1234" in response
+    assert "/yeucau ABCD-1234" in response
+    bot.backup_database_to_telegram.assert_awaited_once_with(context)
 
 
 @pytest.mark.asyncio
@@ -267,15 +300,83 @@ async def test_empty_discovery_fallback_message_has_no_login_button() -> None:
         ),
     )
     bot = AudioBot.__new__(AudioBot)
-    bot.crawler = SimpleNamespace(
-        sniff_urls=AsyncMock(side_effect=NoAudioFoundError("no public audio"))
-    )
+    bot.crawler = SimpleNamespace(sniff_urls=AsyncMock(side_effect=NoAudioFoundError("no public audio")))
 
     await bot.handle_url(update, None)
 
     fallback_call = reply_text.await_args_list[-1]
     assert "Chưa tìm thấy tệp âm thanh" in fallback_call.args[0]
     assert "reply_markup" not in fallback_call.kwargs
+
+
+@pytest.mark.asyncio
+async def test_download_batches_send_original_files_immediately(tmp_path) -> None:
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=77),
+        effective_message=SimpleNamespace(
+            text="https://sounds.example.com/pack",
+            reply_text=AsyncMock(return_value=status_message),
+        ),
+    )
+    urls = [f"https://cdn.example.com/{index}.mp3" for index in range(6)]
+
+    def download(url, raw_dir, _title):
+        path = tmp_path / Path(url).name
+        path.write_bytes(b"audio")
+        return path
+
+    bot = AudioBot.__new__(AudioBot)
+    bot.crawler = SimpleNamespace(
+        sniff_urls=AsyncMock(return_value=urls),
+        download=download,
+        discovered_titles={},
+    )
+    bot.run_dir = tmp_path / "run"
+    bot._send_downloaded_files = AsyncMock(return_value=True)
+
+    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch("bot.JOB_BATCH_FILES", 2):
+        await bot.handle_url(update, None)
+
+    progress_messages = [call.args[0] for call in status_message.edit_text.await_args_list]
+    assert any("Đang đóng gói và gửi" in text for text in progress_messages)
+    assert bot._send_downloaded_files.await_count == 3
+    assert [len(call.args[1]) for call in bot._send_downloaded_files.await_args_list] == [2, 2, 2]
+
+
+@pytest.mark.asyncio
+async def test_url_delivery_never_calls_audio_processing(tmp_path) -> None:
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=77),
+        effective_message=SimpleNamespace(
+            text="https://sounds.example.com/pack",
+            reply_text=AsyncMock(return_value=status_message),
+        ),
+    )
+    urls = [f"https://cdn.example.com/{index}.mp3" for index in range(11)]
+
+    def download(url, _raw_dir, _title):
+        path = tmp_path / Path(url).name
+        path.write_bytes(b"audio")
+        return path
+
+    bot = AudioBot.__new__(AudioBot)
+    bot.crawler = SimpleNamespace(
+        sniff_urls=AsyncMock(return_value=urls),
+        download=download,
+        discovered_titles={},
+    )
+    bot.run_dir = tmp_path / "run"
+    bot._send_downloaded_files = AsyncMock(return_value=True)
+
+    with patch("bot.DOWNLOAD_DIR", tmp_path / "downloads"), patch("bot.JOB_BATCH_FILES", 200):
+        await bot.handle_url(update, None)
+
+    bot._send_downloaded_files.assert_awaited_once()
+    delivered_paths = bot._send_downloaded_files.await_args.args[1]
+    assert len(delivered_paths) == 11
+    assert all(path.suffix == ".mp3" for path in delivered_paths)
 
 
 @pytest.mark.asyncio
@@ -291,15 +392,14 @@ async def test_processed_file_is_returned_through_telegram(tmp_path) -> None:
         effective_message=SimpleNamespace(
             reply_text=reply_text,
             reply_document=reply_document,
-        )
+        ),
     )
     bot = AudioBot.__new__(AudioBot)
     bot.run_dir = tmp_path / "run"
     bot.output_dir = output_root
+    bot.delivery_retry_store = DeliveryRetryStore(tmp_path / "delivery-retries.db")
 
-    await bot._send_processed_files(
-        update, [{"status": "passed", "output": str(output)}], "loopcloud.com"
-    )
+    await bot._send_processed_files(update, [{"status": "passed", "output": str(output)}], "loopcloud.com")
 
     reply_document.assert_awaited_once()
     assert reply_document.await_args.kwargs["filename"] == "loopcloud.com-samples.zip"
@@ -308,6 +408,10 @@ async def test_processed_file_is_returned_through_telegram(tmp_path) -> None:
     assert reply_document.await_args.kwargs["write_timeout"] >= 30
     assert "gom gọn 1 sample" in reply_document.await_args.kwargs["caption"]
     assert not (bot.run_dir / "loopcloud.com-samples.zip").exists()
+    retry_record = bot.delivery_retry_store.load(-1, output_root)
+    assert retry_record is not None
+    assert retry_record.site == "loopcloud.com"
+    assert retry_record.results == ({"status": "passed", "output": str(output.resolve())},)
 
 
 @pytest.mark.asyncio
@@ -326,13 +430,86 @@ async def test_owner_uses_local_library_delivery_by_default(tmp_path) -> None:
     bot.run_dir = tmp_path / "run"
 
     with patch("bot.ADMIN_USER_ID", 42), patch("bot.OWNER_DELIVERY_MODE", "local"):
-        await bot._send_processed_files(
-            update, [{"status": "passed", "output": str(output)}], "splice.com"
-        )
+        await bot._send_processed_files(update, [{"status": "passed", "output": str(output)}], "splice.com")
 
     assert "ĐÃ LƯU KẾT QUẢ TRÊN MÁY" in reply_text.await_args.args[0]
     assert str(bot.output_dir) in reply_text.await_args.args[0]
     reply_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approved_user_can_retry_existing_library_without_reprocessing(tmp_path) -> None:
+    output_root = tmp_path / "organized"
+    first = output_root / "Loops" / "first.wav"
+    second = output_root / "FX" / "second.wav"
+    ignored = output_root / "notes.txt"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_bytes(b"RIFF-first")
+    second.write_bytes(b"RIFF-second")
+    ignored.write_text("not audio", encoding="utf-8")
+    reply_text = AsyncMock()
+    reply_document = AsyncMock()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=77),
+        effective_message=SimpleNamespace(
+            reply_text=reply_text,
+            reply_document=reply_document,
+        ),
+    )
+    bot = AudioBot.__new__(AudioBot)
+    bot.output_dir = output_root
+    bot.run_dir = tmp_path / "run"
+    bot._has_access = lambda _update: True
+    bot.delivery_retry_store = DeliveryRetryStore(tmp_path / "delivery-retries.db")
+    bot.delivery_retry_store.save(
+        77,
+        "splice.com",
+        [
+            {"status": "passed", "output": str(first)},
+            {"status": "passed", "output": str(second)},
+        ],
+        output_root,
+    )
+
+    await bot.cmd_retry_delivery(update, None)
+
+    assert "<b>2</b> sample" in reply_text.await_args_list[0].args[0]
+    assert "không tải hoặc xử lý lại" in reply_text.await_args_list[0].args[0]
+    reply_document.assert_awaited_once()
+    assert reply_document.await_args.kwargs["filename"] == "splice.com-samples.zip"
+    assert first.read_bytes() == b"RIFF-first"
+    assert second.read_bytes() == b"RIFF-second"
+    assert not list((tmp_path / "run").glob("*.zip"))
+
+
+@pytest.mark.asyncio
+async def test_admin_can_assign_pre_manifest_library_to_one_approved_customer(
+    tmp_path,
+) -> None:
+    output_root = tmp_path / "organized"
+    sample = output_root / "Loops" / "sample.wav"
+    sample.parent.mkdir(parents=True)
+    sample.write_bytes(b"RIFF-sample")
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=42),
+        effective_message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    bot = AudioBot.__new__(AudioBot)
+    bot.output_dir = output_root
+    bot.access_control = SimpleNamespace(
+        status_for=lambda user_id: AccessStatus.APPROVED if user_id == 77 else AccessStatus.PENDING
+    )
+    bot.delivery_retry_store = DeliveryRetryStore(tmp_path / "delivery-retries.db")
+
+    with patch("bot.ADMIN_USER_ID", 42):
+        await bot.cmd_assign_retry(update, SimpleNamespace(args=["77"]))
+
+    record = bot.delivery_retry_store.load(77, output_root)
+    assert record is not None
+    assert record.site == "library-recovery"
+    assert record.results == ({"status": "passed", "output": str(sample.resolve())},)
+    assert "ĐÃ GÁN JOB CŨ CHO KHÁCH" in update.effective_message.reply_text.await_args.args[0]
 
 
 @pytest.mark.asyncio

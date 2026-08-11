@@ -33,13 +33,15 @@ from telegram.ext import (
     filters,
 )
 
-from access_control import AccessControlStore, AccessStatus, RequestOutcome
+from access_control import AccessControlStore, AccessStatus, AccessUser, RequestOutcome
 from config import (
     ADMIN_USER_ID,
+    AUDIO_EXTS,
     BASE_DIR,
     DATA_DIR,
     DB_PATH,
     DOWNLOAD_DIR,
+    JOB_BATCH_FILES,
     OUTPUT_DIR,
     OWNER_DELIVERY_MODE,
     TELEGRAM_ARCHIVE_PART_BYTES,
@@ -51,9 +53,10 @@ from config import (
     validate_bot_config,
 )
 from crawler import AudioCrawler
-from delivery import DeliveryService, build_result_archives
+from delivery import DeliveryService, build_original_archives, build_result_archives
 from delivery import build_result_archive as build_result_archive
 from delivery import deliverable_paths as deliverable_paths
+from delivery_retry import DeliveryRetryStore
 from exceptions import (
     BrowserUnavailableError,
     ConfigError,
@@ -65,7 +68,7 @@ from exceptions import (
     NoAudioFoundError,
     PathTraversalError,
 )
-from organize import process_file, run_pipeline
+from organize import run_pipeline
 from organizer import Organizer
 from processor import AudioProcessor
 from quality_gate import QualityGate
@@ -205,6 +208,13 @@ def format_link_progress(
     if stage == "analyzing":
         lines.append(f"⏳ Đang kiểm tra và phân loại: {processed}/{downloaded}")
         return "\n".join(lines)
+    if stage == "packaging":
+        lines.append(f"⏳ Đang đóng gói và gửi {downloaded} file gốc...")
+        return "\n".join(lines)
+    if stage == "complete":
+        lines.append(f"✅ <b>Đã gửi file gốc:</b> {processed} tệp")
+        lines.append("✅ <b>Hoàn tất</b>")
+        return "\n".join(lines)
 
     lines.append(f"✅ <b>Đã kiểm tra và phân loại:</b> {processed} tệp")
     lines.append("✅ <b>Hoàn tất xử lý</b>")
@@ -265,16 +275,16 @@ def format_welcome() -> str:
 
 
 def format_admin_welcome() -> str:
-    """Explain the automatic crawl-filter-return flow."""
+    """Explain the download-first flow shown to approved users."""
     return (
         "🎧 <b>MH - DOWNSAMPLE PRO</b>\n\n"
-        "Bot hỗ trợ tìm và xử lý âm thanh từ nhiều trang khác nhau. Anh không cần chọn "
+        "Bot hỗ trợ tìm và tải âm thanh từ nhiều trang khác nhau. Anh không cần chọn "
         "trước một nền tảng cố định.\n\n"
         "<b>CÁCH SỬ DỤNG</b>\n"
-        "1. Gửi liên kết của trang hoặc tệp âm thanh cần xử lý.\n"
+        "1. Gửi liên kết của trang hoặc gói âm thanh cần tải.\n"
         "2. Bot tự tìm và tải các tệp âm thanh công khai trong liên kết.\n"
-        "3. Tệp tải về được kiểm tra chất lượng, chuẩn hóa và phân loại.\n"
-        "4. Bot gửi lại các tệp đạt chất lượng ngay trong cuộc trò chuyện này."
+        "3. Bot giữ tên file nguồn và chia ZIP dưới 20 MB.\n"
+        "4. Xong mỗi lô, bot gửi ngay rồi mới tải lô tiếp theo."
     )
 
 
@@ -285,7 +295,7 @@ def format_usage_guide() -> str:
         "Dạ, anh/chị chỉ cần thực hiện ba bước sau:\n\n"
         "1. Sao chép liên kết của trang hoặc tệp âm thanh cần xử lý.\n"
         "2. Dán liên kết vào ô tin nhắn trong cuộc trò chuyện này rồi bấm gửi.\n"
-        "3. Em sẽ tự tải, lọc chất lượng và gửi lại tệp kết quả ngay trên Telegram."
+        "3. Em sẽ giữ file gốc, chia ZIP và gửi lại ngay trên Telegram."
     )
 
 
@@ -305,6 +315,12 @@ def main_menu(*, is_admin: bool = False) -> InlineKeyboardMarkup:
                 [
                     InlineKeyboardButton("📁 Xử lý thư mục", callback_data="menu:sap_xep"),
                     InlineKeyboardButton("⚙️ Nơi lưu", callback_data="menu:cai_dat_thu_muc"),
+                ],
+                [
+                    InlineKeyboardButton("🔑 Tạo mã mời", callback_data="menu:tao_ma"),
+                    InlineKeyboardButton(
+                        "👥 Xét duyệt người dùng", callback_data="menu:xet_duyet"
+                    ),
                 ],
             ]
         )
@@ -372,6 +388,50 @@ def admin_access_keyboard(user_id: int, status: AccessStatus) -> InlineKeyboardM
     )
 
 
+def pending_access_keyboard(users: Sequence[AccessUser]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for user in users:
+        label = user.full_name or (
+            f"@{user.username}" if user.username else str(user.telegram_user_id)
+        )
+        short_label = label[:24]
+        prefix = f"access:admin:{{action}}:{user.telegram_user_id}:pending"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ {short_label}",
+                    callback_data=prefix.format(action="approve"),
+                ),
+                InlineKeyboardButton(
+                    "❌", callback_data=prefix.format(action="reject")
+                ),
+                InlineKeyboardButton(
+                    "⛔", callback_data=prefix.format(action="block")
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="menu:quay_lai")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_pending_access(users: Sequence[AccessUser]) -> str:
+    if not users:
+        return (
+            "👥 <b>XÉT DUYỆT NGƯỜI DÙNG</b>\n\n"
+            "✅ Hiện không có yêu cầu nào đang chờ duyệt."
+        )
+    lines = ["👥 <b>XÉT DUYỆT NGƯỜI DÙNG</b>", ""]
+    for index, user in enumerate(users, start=1):
+        name = html.escape(user.full_name or "Không có tên")
+        username = html.escape(f"@{user.username}" if user.username else "Không có")
+        lines.append(
+            f"{index}. <b>{name}</b> — "
+            f"<code>{user.telegram_user_id}</code> — {username}"
+        )
+    lines.append("\nBấm ✅ để duyệt, ❌ để từ chối hoặc ⛔ để chặn.")
+    return "\n".join(lines)
+
+
 class AudioBot:
     def __init__(self) -> None:
         validate_bot_config()
@@ -379,6 +439,7 @@ class AudioBot:
         if ACCESS_DB_PATH.resolve() == DB_PATH.resolve():
             raise ConfigError("Access-control database must differ from audio-library database")
         self.access_control = AccessControlStore(ACCESS_DB_PATH)
+        self.delivery_retry_store = DeliveryRetryStore(DATA_DIR / "delivery-retries.db")
         self.run_dir = setup_cleanup(TEMP_ROOT)
         self.gate = QualityGate()
         self.processor = AudioProcessor()
@@ -558,6 +619,18 @@ class AudioBot:
                 parse_mode="HTML",
             )
 
+    async def cmd_pending_access(
+        self, update: Update, _context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not self._is_admin(update) or not update.effective_message:
+            return
+        users = self.access_control.list_users(status=AccessStatus.PENDING, limit=20)
+        await update.effective_message.reply_text(
+            format_pending_access(users),
+            parse_mode="HTML",
+            reply_markup=pending_access_keyboard(users),
+        )
+
     async def handle_access_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -706,6 +779,32 @@ class AudioBot:
                 reply_markup=back_to_menu(),
             )
             return
+        if action == "tao_ma" and is_admin:
+            code = self.access_control.create_invite(
+                created_by=ADMIN_USER_ID,
+                ttl=timedelta(hours=24),
+            )
+            await self.backup_database_to_telegram(context)
+            await query.edit_message_text(
+                "🔑 <b>MÃ MỜI DÙNG MỘT LẦN</b>\n\n"
+                f"<code>{code}</code>\n\n"
+                "Hết hạn sau 24 giờ. Gửi nguyên dòng này cho người dùng:\n"
+                f"<code>/yeucau {code}</code>",
+                parse_mode="HTML",
+                reply_markup=back_to_menu(),
+            )
+            return
+        if action == "xet_duyet" and is_admin:
+            users = self.access_control.list_users(
+                status=AccessStatus.PENDING,
+                limit=20,
+            )
+            await query.edit_message_text(
+                format_pending_access(users),
+                parse_mode="HTML",
+                reply_markup=pending_access_keyboard(users),
+            )
+            return
         if action == "sap_xep" and is_admin:
             await query.edit_message_text(
                 "📁 <b>XỬ LÝ THƯ MỤC TRÊN MÁY CHỦ</b>\n\n"
@@ -807,11 +906,118 @@ class AudioBot:
                 update, "❌ Em chưa xử lý được thư mục này. Anh kiểm tra lại tệp và thử lại nhé."
             )
 
-    def _delivery_service(self) -> DeliveryService:
+    async def cmd_retry_delivery(
+        self, update: Update, _context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Re-send only the requesting user's latest job manifest."""
+        if not self._has_access(update):
+            await self._reply_access_gate(update)
+            return
+        message = update.effective_message
+        user = update.effective_user
+        if not message or not user:
+            return
+        try:
+            record = self.delivery_retry_store.load(user.id, self.output_dir)
+        except Exception:
+            logger.exception("Không thể đọc manifest delivery của Telegram ID %s", user.id)
+            await send_chunked(
+                update,
+                "❌ Chưa thể đọc lịch sử giao file của anh/chị. Vui lòng thử lại sau.",
+            )
+            return
+        if record is None:
+            await send_chunked(
+                update,
+                "⚠️ Chưa có job nào của tài khoản này để tải lại. "
+                "Bot không lấy file từ thư viện của người dùng khác.",
+            )
+            return
+
+        await send_chunked(
+            update,
+            f"⏳ Đang đóng gói lại <b>{len(record.results)}</b> sample từ job gần nhất. "
+            "Bot không tải hoặc xử lý lại từ đầu.",
+        )
+        await self._delivery_service(owner_mode="telegram").deliver(
+            message,
+            record.results,
+            record.site,
+            is_owner=False,
+        )
+
+    async def cmd_assign_retry(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Let the admin recover a pre-manifest library for one explicit customer."""
+        if not self._is_admin(update):
+            return
+        if not context.args:
+            await send_chunked(
+                update,
+                "⚠️ Nhập Telegram ID của khách. Ví dụ: <code>/ganjob 123456789</code>",
+            )
+            return
+        try:
+            target_id = int(context.args[0])
+        except (TypeError, ValueError):
+            await send_chunked(update, "❌ Telegram ID không hợp lệ.")
+            return
+        if target_id <= 0:
+            await send_chunked(update, "❌ Telegram ID phải là số dương.")
+            return
+        if (
+            target_id != ADMIN_USER_ID
+            and self.access_control.status_for(target_id) is not AccessStatus.APPROVED
+        ):
+            await send_chunked(
+                update,
+                "❌ Tài khoản đích chưa được duyệt. Bot chưa gán file.",
+            )
+            return
+
+        try:
+            paths = sorted(
+                (
+                    path
+                    for path in self.output_dir.rglob("*")
+                    if path.is_file() and path.suffix.lower() in AUDIO_EXTS
+                ),
+                key=lambda path: path.as_posix().lower(),
+            )
+        except OSError:
+            logger.exception("Không thể quét thư viện để cứu job cũ")
+            await send_chunked(update, "❌ Không thể đọc thư viện hiện tại.")
+            return
+        if not paths:
+            await send_chunked(update, "⚠️ Thư viện hiện tại không còn file audio.")
+            return
+
+        results = [{"status": "passed", "output": str(path)} for path in paths]
+        try:
+            saved = self.delivery_retry_store.save(
+                target_id,
+                "library-recovery",
+                results,
+                self.output_dir,
+            )
+        except Exception:
+            logger.exception("Không thể gán job cũ cho Telegram ID %s", target_id)
+            await send_chunked(update, "❌ Chưa thể lưu manifest cứu hộ.")
+            return
+        await send_chunked(
+            update,
+            "✅ <b>ĐÃ GÁN JOB CŨ CHO KHÁCH</b>\n\n"
+            f"• Telegram ID: <code>{target_id}</code>\n"
+            f"• Số file: <b>{saved}</b>\n\n"
+            "Khách gửi <code>/taigoi</code> để nhận file.",
+        )
+
+    def _delivery_service(self, *, owner_mode: str | None = None) -> DeliveryService:
         return DeliveryService(
             output_root=self.output_dir,
             temp_root=self.run_dir,
-            owner_mode=OWNER_DELIVERY_MODE,
+            owner_mode=owner_mode or OWNER_DELIVERY_MODE,
             archive_part_bytes=TELEGRAM_ARCHIVE_PART_BYTES,
             upload_retries=TELEGRAM_UPLOAD_RETRIES,
             upload_timeout_sec=TELEGRAM_UPLOAD_TIMEOUT_SEC,
@@ -833,17 +1039,73 @@ class AudioBot:
         return await service.send_archive_with_retry(message, archive_path, caption)
 
     async def _send_processed_files(
-        self, update: Update, results: Sequence[Mapping[str, Any]], site: str
+        self,
+        update: Update,
+        results: Sequence[Mapping[str, Any]],
+        site: str,
+        *,
+        retry_results: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         message = update.effective_message
         if not message:
             return
+        user = update.effective_user
+        retry_store = getattr(self, "delivery_retry_store", None)
+        if user and retry_store:
+            try:
+                retry_store.save(
+                    user.id,
+                    site,
+                    retry_results if retry_results is not None else results,
+                    self.output_dir,
+                )
+            except Exception:
+                logger.exception(
+                    "Không thể lưu manifest delivery cho Telegram ID %s", user.id
+                )
         await self._delivery_service().deliver(
             message,
             results,
             site,
             is_owner=self._is_admin(update),
         )
+
+    async def _send_downloaded_files(
+        self,
+        update: Update,
+        paths: Sequence[Path],
+        site: str,
+        raw_root: Path,
+    ) -> bool:
+        """Send original downloads immediately without analysis, conversion, or renaming."""
+        message = update.effective_message
+        if not message or not paths:
+            return False
+        results = [{"status": "passed", "output": str(path)} for path in paths]
+        service = DeliveryService(
+            output_root=raw_root,
+            temp_root=self.run_dir,
+            owner_mode="telegram",
+            archive_part_bytes=min(TELEGRAM_ARCHIVE_PART_BYTES, 10 * 1024 * 1024),
+            upload_retries=min(TELEGRAM_UPLOAD_RETRIES, 2),
+            upload_timeout_sec=TELEGRAM_UPLOAD_TIMEOUT_SEC,
+            archive_builder=build_original_archives,
+            original_files=True,
+            upload_attempt_guard_sec=45,
+        )
+        report = await service.deliver(message, results, site, is_owner=False)
+        delivered = bool(report.sent_parts) and not report.failed_parts and not report.build_failed
+        if delivered:
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Không thể dọn file gốc đã gửi: %s", path)
+            try:
+                raw_root.rmdir()
+            except OSError:
+                pass
+        return delivered
 
     async def handle_url(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -860,18 +1122,23 @@ class AudioBot:
             if not urls:
                 raise NoAudioFoundError(f"No public audio assets were discovered on {site}")
             logger.info("Đã tìm thấy %d đường dẫn âm thanh từ %s", len(urls), site)
-            raw_dir = DOWNLOAD_DIR / site
+            raw_root = DOWNLOAD_DIR / site
+            raw_root.mkdir(parents=True, exist_ok=True)
+            raw_dir = Path(tempfile.mkdtemp(prefix="job-", dir=raw_root))
             await status_message.edit_text(
                 format_link_progress("downloading", discovered=len(urls)),
                 parse_mode="HTML",
             )
-            results = []
-            downloaded_files: list[Path] = []
             loop = asyncio.get_running_loop()
-            semaphore = asyncio.Semaphore(4)
+            download_semaphore = asyncio.Semaphore(4)
+            downloaded_total = 0
+            processed_total = 0
+            failures = 0
+            delivered_batches = 0
+            total_batches = (len(urls) + JOB_BATCH_FILES - 1) // JOB_BATCH_FILES
 
             async def download_one(audio_url: str) -> Path | None:
-                async with semaphore:
+                async with download_semaphore:
                     return await loop.run_in_executor(
                         None,
                         partial(
@@ -882,33 +1149,91 @@ class AudioBot:
                         ),
                     )
 
-            tasks = [asyncio.create_task(download_one(audio_url)) for audio_url in urls]
-            failures = 0
-            for completed, task in enumerate(asyncio.as_completed(tasks), start=1):
-                try:
-                    downloaded = await task
-                    if downloaded is not None:
-                        downloaded_files.append(downloaded)
-                    else:
-                        failures += 1
-                except CrawlerError as exc:
-                    failures += 1
-                    logger.warning("Không tải được một đường dẫn âm thanh: %s", exc)
-                if completed % 10 == 0 or completed == len(tasks):
+            for batch_number, start in enumerate(
+                range(0, len(urls), JOB_BATCH_FILES), start=1
+            ):
+                batch_urls = urls[start : start + JOB_BATCH_FILES]
+                batch_downloaded: list[Path] = []
+                download_tasks = [
+                    asyncio.create_task(download_one(audio_url))
+                    for audio_url in batch_urls
+                ]
+                for completed, download_task in enumerate(
+                    asyncio.as_completed(download_tasks), start=1
+                ):
                     try:
-                        await status_message.edit_text(
-                            format_link_progress(
-                                "downloading",
-                                discovered=len(urls),
-                                downloaded=completed,
-                                failed_downloads=failures,
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except TelegramError:
-                        pass
+                        downloaded = await download_task
+                        if downloaded is not None:
+                            batch_downloaded.append(downloaded)
+                            downloaded_total += 1
+                        else:
+                            failures += 1
+                    except Exception as exc:
+                        failures += 1
+                        logger.warning("Không tải được một đường dẫn âm thanh: %s", exc)
+                    if completed == 1 or completed % 10 == 0 or completed == len(batch_urls):
+                        try:
+                            await status_message.edit_text(
+                                format_link_progress(
+                                    "downloading",
+                                    discovered=len(urls),
+                                    downloaded=downloaded_total,
+                                    failed_downloads=failures,
+                                ),
+                                parse_mode="HTML",
+                            )
+                        except TelegramError:
+                            pass
 
-            if not downloaded_files:
+                if not batch_downloaded:
+                    continue
+
+                processed_total += len(batch_downloaded)
+                try:
+                    await status_message.edit_text(
+                        format_link_progress(
+                            "packaging",
+                            discovered=len(urls),
+                            downloaded=downloaded_total,
+                            processed=processed_total,
+                            failed_downloads=failures,
+                        ),
+                        parse_mode="HTML",
+                    )
+                except TelegramError:
+                    pass
+                delivered = await self._send_downloaded_files(
+                    update,
+                    batch_downloaded,
+                    site,
+                    raw_dir,
+                )
+                if not delivered:
+                    await status_message.edit_text(
+                        format_link_failure(
+                            f"Không gửi được lô {batch_number}/{total_batches}. "
+                            "Bot đã dừng trước khi tải lô tiếp theo."
+                        ),
+                        parse_mode="HTML",
+                    )
+                    return
+                delivered_batches += 1
+                try:
+                    await status_message.edit_text(
+                        format_link_progress(
+                            "packaging",
+                            discovered=len(urls),
+                            downloaded=downloaded_total,
+                            processed=processed_total,
+                            failed_downloads=failures,
+                        )
+                        + f"\n✅ Đã gửi xong lô {batch_number}/{total_batches}.",
+                        parse_mode="HTML",
+                    )
+                except TelegramError:
+                    pass
+
+            if downloaded_total == 0:
                 await status_message.edit_text(
                     format_link_failure(
                         f"⚠️ Không tải được tệp âm thanh nào từ {len(urls)} đường dẫn đã tìm thấy. "
@@ -920,71 +1245,19 @@ class AudioBot:
 
             await status_message.edit_text(
                 format_link_progress(
-                    "analyzing",
-                    discovered=len(urls),
-                    downloaded=len(downloaded_files),
-                    failed_downloads=failures,
-                ),
-                parse_mode="HTML",
-            )
-            for processed, downloaded in enumerate(downloaded_files, start=1):
-                result = await loop.run_in_executor(
-                    None,
-                    partial(
-                        process_file,
-                        downloaded,
-                        site,
-                        self.gate,
-                        self.processor,
-                        self.organizer,
-                        self.run_dir,
-                        delete_source=False,
-                        ephemeral=False,
-                    ),
-                )
-                source_hash = str(result.get("source_hash") or "")
-                if downloaded.exists() and source_hash:
-                    try:
-                        archived = await loop.run_in_executor(
-                            None,
-                            partial(
-                                self.organizer.archive_raw,
-                                downloaded,
-                                DOWNLOAD_DIR,
-                                site,
-                                result.get("analysis"),
-                                source_hash,
-                            ),
-                        )
-                        result["raw"] = str(archived)
-                    except OSError:
-                        logger.exception("Không thể sắp xếp tệp raw %s", downloaded)
-                results.append(result)
-                if processed % 10 == 0 or processed == len(downloaded_files):
-                    try:
-                        await status_message.edit_text(
-                            format_link_progress(
-                                "analyzing",
-                                discovered=len(urls),
-                                downloaded=len(downloaded_files),
-                                processed=processed,
-                                failed_downloads=failures,
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except TelegramError:
-                        pass
-            await status_message.edit_text(
-                format_link_progress(
                     "complete",
                     discovered=len(urls),
-                    downloaded=len(downloaded_files),
-                    processed=len(results),
+                    downloaded=downloaded_total,
+                    processed=processed_total,
                     failed_downloads=failures,
                 ),
                 parse_mode="HTML",
             )
-            await self._send_processed_files(update, results, site)
+            if delivered_batches == 0:
+                await status_message.edit_text(
+                    format_link_failure("Không có file gốc nào được gửi."),
+                    parse_mode="HTML",
+                )
         except CrawlerError as exc:
             logger.warning("Không thể quét liên kết từ %s: %s", site, exc)
             error_text = format_crawler_error(exc)
@@ -1104,24 +1377,27 @@ class AudioBot:
             logger.warning("Không thể tự động khôi phục database từ Telegram: %s", e)
 
         name = "MH - Downsample Pro"
-        short_description = "Thu thập, chuẩn hóa và phân loại mẫu âm thanh dành cho người làm nhạc."
+        short_description = "Tải file âm thanh gốc, giữ tên nguồn và gửi ZIP theo từng lô."
         description = (
-            "🎧 Trợ lý xử lý mẫu âm thanh dành cho người làm nhạc Việt Nam.\n\n"
-            "Gửi một đường dẫn có âm thanh để hệ thống tìm mẫu, kiểm tra chất lượng, "
-            "chuẩn hóa, phân loại và gửi tệp kết quả ngay trên Telegram."
+            "🎧 Trợ lý tải mẫu âm thanh dành cho người làm nhạc Việt Nam.\n\n"
+            "Gửi một đường dẫn có âm thanh để hệ thống tải file gốc, giữ tên nguồn, "
+            "chia ZIP an toàn và gửi từng lô ngay trên Telegram."
         )
         public_commands = [
             BotCommand("batdau", "Mở hướng dẫn sử dụng"),
             BotCommand("yeucau", "Gửi yêu cầu bằng mã mời"),
             BotCommand("quyen", "Xem trạng thái quyền sử dụng"),
             BotCommand("thongke", "Xem thống kê thư viện âm thanh"),
+            BotCommand("taigoi", "Đóng gói lại thư viện hiện có"),
         ]
         admin_commands = [
             *public_commands,
             BotCommand("taoma", "Tạo mã mời dùng một lần"),
+            BotCommand("duyet", "Xem người dùng đang chờ duyệt"),
             BotCommand("thumuc", "Xem nơi lưu âm thanh trên máy chủ"),
             BotCommand("datthumuc", "Chọn nơi lưu sample trên máy chủ"),
             BotCommand("sapxep", "Xử lý một thư mục trên máy chủ"),
+            BotCommand("ganjob", "Gán job cũ cho đúng khách"),
         ]
         try:
             if (await application.bot.get_my_name()).name != name:
@@ -1207,10 +1483,13 @@ class AudioBot:
         application.add_handler(CommandHandler("yeucau", self.cmd_request_access))
         application.add_handler(CommandHandler("quyen", self.cmd_access_status))
         application.add_handler(CommandHandler("taoma", self.cmd_create_invite))
+        application.add_handler(CommandHandler("duyet", self.cmd_pending_access))
         application.add_handler(CommandHandler(["stats", "thongke"], self.cmd_authorized_stats))
         application.add_handler(CommandHandler(["path", "thumuc"], self.cmd_path))
         application.add_handler(CommandHandler("datthumuc", self.cmd_set_output))
         application.add_handler(CommandHandler(["organize", "sapxep"], self.cmd_organize))
+        application.add_handler(CommandHandler("taigoi", self.cmd_retry_delivery))
+        application.add_handler(CommandHandler("ganjob", self.cmd_assign_retry))
         application.add_handler(
             CallbackQueryHandler(self.handle_access_callback, pattern=r"^access:")
         )

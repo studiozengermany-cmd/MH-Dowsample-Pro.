@@ -36,10 +36,7 @@ def test_access_database_is_separate_from_audio_library_database(tmp_path) -> No
     store = AccessControlStore(access_db)
 
     with sqlite3.connect(store.db_path) as connection:
-        tables = {
-            row[0]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
     assert store.db_path != audio_db
     assert {"access_users", "invite_codes"}.issubset(tables)
@@ -172,6 +169,45 @@ async def test_admin_command_creates_a_usable_one_time_invite(tmp_path) -> None:
         )
         is RequestOutcome.CREATED
     )
+
+
+def test_admin_can_list_pending_users_for_review(tmp_path) -> None:
+    store = AccessControlStore(tmp_path / "access.db")
+    first_code = store.create_invite(created_by=999, code="LIST1001", now=NOW)
+    second_code = store.create_invite(created_by=999, code="LIST2002", now=NOW)
+    assert _submit(store, 1001, first_code) is RequestOutcome.CREATED
+    assert _submit(store, 2002, second_code) is RequestOutcome.CREATED
+    assert store.set_status(2002, AccessStatus.APPROVED, decided_by=999, now=NOW)
+
+    pending = store.list_users(status=AccessStatus.PENDING)
+
+    assert [user.telegram_user_id for user in pending] == [1001]
+
+
+@pytest.mark.asyncio
+async def test_admin_pending_screen_has_review_buttons(tmp_path) -> None:
+    store = AccessControlStore(tmp_path / "access.db")
+    code = store.create_invite(created_by=999, code="SCREEN01", now=NOW)
+    assert _submit(store, 1001, code) is RequestOutcome.CREATED
+    reply_text = AsyncMock()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=999),
+        effective_message=SimpleNamespace(reply_text=reply_text),
+    )
+    instance = AudioBot.__new__(AudioBot)
+    instance.access_control = store
+
+    with patch("bot.ADMIN_USER_ID", 999):
+        await instance.cmd_pending_access(update, SimpleNamespace())
+
+    response = reply_text.await_args.args[0]
+    keyboard = reply_text.await_args.kwargs["reply_markup"]
+    callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+    assert "XÉT DUYỆT NGƯỜI DÙNG" in response
+    assert "1001" in response
+    assert "access:admin:approve:1001:pending" in callbacks
+    assert "access:admin:reject:1001:pending" in callbacks
+    assert "access:admin:block:1001:pending" in callbacks
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,23 @@
 import asyncio
 import multiprocessing
-import os
+import time
 from pathlib import Path
 
+import organize
 from organize import run_pipeline
 
 
-def test_worker_timeout_and_batch_continues(tmp_path):
+def _controlled_worker(path, _site, _staging_dir, _dry_run, conn):
+    try:
+        if "hang" in str(path):
+            time.sleep(10)
+        else:
+            conn.send({"status": "error", "error": "controlled fast failure"})
+    finally:
+        conn.close()
+
+
+def test_worker_timeout_and_batch_continues(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
     input_dir.mkdir()
@@ -17,45 +28,18 @@ def test_worker_timeout_and_batch_continues(tmp_path):
     file2 = input_dir / "fast.mp3"
     file2.write_text("fake audio data")
 
-    # Inject a sitecustomize.py to monkeypatch QualityGate in the child process
-    sitecustomize_path = tmp_path / "sitecustomize.py"
-    sitecustomize_path.write_text("""
-import os
-import time
-import sys
+    monkeypatch.setattr(organize, "_worker_process_file", _controlled_worker)
 
-if os.environ.get("MOCK_HANG_ACTIVE") == "1":
-    try:
-        import quality_gate
-        original_analyze = quality_gate.QualityGate.analyze
-        def fake_analyze(self, path):
-            if "hang" in str(path):
-                time.sleep(10)
-            return original_analyze(self, path)
-        quality_gate.QualityGate.analyze = fake_analyze
-    except Exception as e:
-        pass
-""")
-    
-    old_pythonpath = os.environ.get("PYTHONPATH", "")
-    os.environ["PYTHONPATH"] = f"{tmp_path}{os.pathsep}{old_pythonpath}"
-    os.environ["MOCK_HANG_ACTIVE"] = "1"
-    
-    try:
-        # Run pipeline with a 2-second timeout
-        # Using 2 workers so they run concurrently
-        counts = asyncio.run(
-            run_pipeline(
-                input_dir,
-                output_dir,
-                timeout_sec=2,
-                workers=2,
-                batch_size=2
-            )
+    # Run pipeline with a 2-second timeout and two concurrent workers.
+    counts = asyncio.run(
+        run_pipeline(
+            input_dir,
+            output_dir,
+            timeout_sec=2,
+            workers=2,
+            batch_size=2,
         )
-    finally:
-        os.environ["PYTHONPATH"] = old_pythonpath
-        del os.environ["MOCK_HANG_ACTIVE"]
+    )
 
     # The hang file should timeout
     assert counts["file_timeout"] == 1

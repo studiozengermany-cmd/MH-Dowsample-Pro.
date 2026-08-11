@@ -636,7 +636,7 @@ class AudioCrawler:
                 suffix = (
                     raw_suffix if raw_suffix in _AUDIO_SUFFIXES else _response_audio_suffix(response, url)
                 )
-                if suggested_name and (_opaque_download_name(raw) or raw_suffix not in _AUDIO_SUFFIXES):
+                if suggested_name:
                     raw = f"{Path(suggested_name).stem}{suffix}"
                 elif raw_suffix not in _AUDIO_SUFFIXES:
                     raw = f"{Path(raw).stem}{suffix}"
