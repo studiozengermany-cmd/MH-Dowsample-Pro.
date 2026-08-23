@@ -305,6 +305,7 @@ class QualityGate:
             "genre_hint": "other",
             "content_type": "unknown",
             "issues": [],
+            "warnings": [],
         }
         try:
             y, sr = self._load_audio(path)
@@ -340,9 +341,9 @@ class QualityGate:
             bass_ratio = float(np.sum(spectrum[freqs < 200]) / total)
             high_ratio = float(np.sum(spectrum[freqs > 4000]) / total)
             if bass_ratio < 0.002:
-                result["issues"].append("No bass content")
+                result["warnings"].append("No bass content")
             if high_ratio < 0.0001:
-                result["issues"].append("No high-freq content")
+                result["warnings"].append("No high-freq content")
             centroid = float(np.mean(librosa.feature.spectral_centroid(y=mono, sr=sr)))
             result["spectral_centroid_hz"] = round(centroid, 2)
             result["key"] = self._detect_key(mono, sr)

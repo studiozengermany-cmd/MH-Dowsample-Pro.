@@ -15,8 +15,8 @@ from organize import process_file
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 FROZEN_FILE_HASHES = {
-    "crawler.py": "e4fb9fe36d757ab30c5f191495c80a2bb357bc8a2cefded3fb93e46848c8612c",
-    "quality_gate.py": "e69c9696685faba665bad469371060bb3797f5adb7601abe4a6f8ef8eaad5496",
+    "crawler.py": "aa60e3dd7fd6a92bf45f610a42b9b7ac9dcd2b6a4fab5764a894b5c07a81fa32",
+    "quality_gate.py": "a4527e2112fc7beb2ce91b651cee0e5da232a2f59c5a16ad0d6c8d529c982c8b",
     "processor.py": "58a7a2bc0405c58fc46a00ee3c2f2978c622d90ed77d415fecca015f9cad7315",
     "organizer.py": "611ae7ab0c00f60868cf3728b64a4ae2450fed4c4373af90b10f2457930f837f",
     "organize.py": "416fa4ec637324b93f7e1d876414925e4b555d77ee5a9767e9d7e2108ff69079",

@@ -6,7 +6,7 @@
   <p>
     <a href="https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO/actions/workflows/ci.yml"><img src="https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.11+"></a>
-    <a href="https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO"><img src="https://img.shields.io/badge/version-4.1.0-B8FF2C?labelColor=090B0D" alt="Version 4.1.0"></a>
+    <a href="https://github.com/studiozengermany-cmd/MH---DOWSAMPLE-PRO"><img src="https://img.shields.io/badge/version-4.2.0-B8FF2C?labelColor=090B0D" alt="Version 4.2.0"></a>
     <a href="LICENSE"><img src="https://img.shields.io/github/license/studiozengermany-cmd/MH---DOWSAMPLE-PRO" alt="MIT License"></a>
   </p>
   <p><a href="#features">Features</a> · <a href="#quick-start">Quick start</a> · <a href="#usage">Usage</a> · <a href="#telegram-bot">Telegram bot</a> · <a href="#development">Development</a></p>

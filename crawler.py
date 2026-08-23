@@ -8,6 +8,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 
@@ -21,6 +22,7 @@ from config import (
     CRAWL_LAUNCH_TIMEOUT_MS,
     CRAWL_TIMEOUT_SEC,
     CRAWL_WAIT_SEC,
+    FILE_PROCESS_TIMEOUT_SEC,
     QUALITY,
     configure_playwright_runtime,
 )
@@ -647,13 +649,12 @@ class AudioCrawler:
                 target = self._available_path(target)
                 partial = target.with_suffix(target.suffix + ".part")
                 maximum = int(QUALITY["max_file_mb"]) * 1024 * 1024
-                import time
                 start_time = time.time()
                 total = 0
                 try:
                     with partial.open("xb") as handle:
                         for chunk in response.iter_content(64 * 1024):
-                            if time.time() - start_time > 15:
+                            if time.time() - start_time > FILE_PROCESS_TIMEOUT_SEC:
                                 raise NetworkError("Download taking too long")
                             if not chunk:
                                 continue

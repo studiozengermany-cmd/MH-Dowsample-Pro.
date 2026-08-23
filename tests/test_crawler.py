@@ -553,3 +553,37 @@ def test_download_returns_none_when_pre_check_fails(
 
     result = instance.download("https://example.com/bad.txt")
     assert result is None
+
+
+def test_download_respects_file_process_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = SimpleNamespace(pre_download_ok=lambda *_args: (True, "ok"))
+    
+    time_offset = 0.0
+    original_time = crawler.time.time
+    
+    # We patch crawler.time.time using a nonlocal offset that increases during download
+    monkeypatch.setattr(crawler.time, "time", lambda: original_time() + time_offset)
+    
+    def slow_iter_content(_size):
+        nonlocal time_offset
+        yield b"chunk1"
+        # Increase time offset beyond dynamic FILE_PROCESS_TIMEOUT_SEC config
+        time_offset += crawler.FILE_PROCESS_TIMEOUT_SEC + 10
+        yield b"chunk2"
+        
+    response = SimpleNamespace(
+        status_code=200,
+        headers={},
+        history=[],
+        url="https://cdn.example/long.mp3",
+        iter_content=slow_iter_content,
+        close=lambda: None,
+    )
+    session = SimpleNamespace(get=lambda *args, **kwargs: response, close=lambda: None, headers={})
+    instance = AudioCrawler(tmp_path, gate=gate, session=session)
+    monkeypatch.setattr(crawler, "validate_public_url", lambda _url: None)
+
+    with pytest.raises(NetworkError, match="Download taking too long"):
+        instance.download(response.url)

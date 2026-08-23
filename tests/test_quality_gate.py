@@ -48,6 +48,7 @@ def test_analyze_returns_stable_contract(full_band_wav: Path, monkeypatch) -> No
         "genre_hint",
         "content_type",
         "issues",
+        "warnings",
     }
     assert set(result) == expected
     assert result["bitrate_kbps"] == 320
@@ -104,3 +105,21 @@ def test_pre_download_falls_back_to_ranged_get_when_signed_url_rejects_head() ->
     )
 
     assert QualityGate().pre_download_ok("https://cdn.example/audio.mp3", session) == (True, "ok")
+
+
+def test_frequency_ratios_warn_but_do_not_fail_passed(full_band_wav: Path, monkeypatch) -> None:
+    gate = QualityGate()
+    # Mock _get_bitrate to pass
+    monkeypatch.setattr(gate, "_get_bitrate", lambda _path, *args, **kwargs: 320)
+    # Mock mono audio to be a pure 100Hz sine wave (No high-freq content)
+    # 44100 Hz sample rate, 1 second duration
+    t = np.linspace(0, 1.0, 44100, endpoint=False)
+    pure_bass = np.sin(2 * np.pi * 100 * t) # 100 Hz (Bass only)
+    
+    # Mock _load_audio to return this pure bass
+    monkeypatch.setattr(gate, "_load_audio", lambda _path: (pure_bass, 44100))
+    
+    result = gate.analyze(full_band_wav)
+    assert "No high-freq content" in result["warnings"]
+    assert "No high-freq content" not in result["issues"]
+    assert result["passed"] is True

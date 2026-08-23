@@ -17,6 +17,12 @@ from exceptions import ConfigError
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 
+# Auto-add local bin directory containing ffmpeg/ffprobe to PATH
+bin_dir = BASE_DIR / "bin"
+if bin_dir.exists() and str(bin_dir) not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+
+
 
 def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
     try:

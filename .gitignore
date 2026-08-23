@@ -3,6 +3,15 @@
 .env.*
 !.env.example
 .venv/
+.venv_new/
+
+# Bundled local binaries and quarantined files
+bin/
+Quarantine/
+
+# Local research/agent workspace and Windows-fix scripts
+rac/
+tools/windows-fixes/
 
 # Python caches and test artifacts
 __pycache__/

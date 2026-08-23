@@ -131,7 +131,7 @@ async def test_request_notifies_admin_with_approve_reject_and_block_buttons(tmp_
     instance = AudioBot.__new__(AudioBot)
     instance.access_control = store
 
-    with patch("bot.ADMIN_USER_ID", 999):
+    with patch("bot.ADMIN_USER_ID", 999), patch("access_control._utc_now", return_value=NOW):
         await instance.cmd_request_access(update, context)
 
     assert store.status_for(1001) is AccessStatus.PENDING
