@@ -123,3 +123,15 @@ def test_frequency_ratios_warn_but_do_not_fail_passed(full_band_wav: Path, monke
     assert "No high-freq content" in result["warnings"]
     assert "No high-freq content" not in result["issues"]
     assert result["passed"] is True
+
+
+def test_long_duration_file_is_rejected(full_band_wav: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = QualityGate()
+    monkeypatch.setattr(gate, "_get_bitrate", lambda _path, *args, **kwargs: 320)
+    # Mock long signal of 601 seconds
+    sr = 44100
+    long_audio = np.zeros(sr * 601, dtype=np.float32)
+    monkeypatch.setattr(gate, "_load_audio", lambda _path: (long_audio, sr))
+    result = gate.analyze(full_band_wav)
+    assert result["passed"] is False
+    assert any("Duration exceeds maximum sample limit" in issue for issue in result["issues"])

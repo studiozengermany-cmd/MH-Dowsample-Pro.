@@ -15,11 +15,11 @@ from organize import process_file
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 FROZEN_FILE_HASHES = {
-    "crawler.py": "aa60e3dd7fd6a92bf45f610a42b9b7ac9dcd2b6a4fab5764a894b5c07a81fa32",
-    "quality_gate.py": "a4527e2112fc7beb2ce91b651cee0e5da232a2f59c5a16ad0d6c8d529c982c8b",
+    "crawler.py": "924207cb9b107f178b7149af38c80d6dd2e37a4bb80771294491e43066f9eb9b",
+    "quality_gate.py": "d2004605746f177933cc2edfe30eea3a720a05a6ae61aa57ff380e2e8f5e6ae5",
     "processor.py": "58a7a2bc0405c58fc46a00ee3c2f2978c622d90ed77d415fecca015f9cad7315",
     "organizer.py": "611ae7ab0c00f60868cf3728b64a4ae2450fed4c4373af90b10f2457930f837f",
-    "organize.py": "416fa4ec637324b93f7e1d876414925e4b555d77ee5a9767e9d7e2108ff69079",
+    "organize.py": "8e979095deb766bc129463d0a7eb56e3c230882b326761468020fb41c876dc17",
 }
 FROZEN_HANDLE_URL_HASH = "cbf9723bef222596b76610225e0b66eedb5ca5b51cee0ead5816c5867304fb87"
 

@@ -211,6 +211,12 @@ def process_file(
             _kill_process_tree(pid)
             p.join(1)
             parent_conn.close()
+            # Clean up lingering staged files from timeout process
+            for staged_candidate in staging_dir.glob(f"{path.stem}.processed*.wav"):
+                try:
+                    staged_candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return {
                 "status": "file_timeout",
                 "file": str(path),

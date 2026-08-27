@@ -25,6 +25,7 @@ REGULARITY_WEIGHT = 0.30
 BEAT_WEIGHT = 0.25
 ZCR_WEIGHT = 0.10
 LOOP_THRESHOLD = 0.58
+MAX_ANALYSIS_DURATION_SEC = 600.0
 _AUDIO_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".aiff", ".aif"}
 
 
@@ -317,6 +318,11 @@ class QualityGate:
             result.update(
                 bitrate_kbps=bitrate, duration_sec=round(duration, 3), sample_rate=sr, channels=channels
             )
+            if duration > MAX_ANALYSIS_DURATION_SEC:
+                result["issues"].append(
+                    f"Duration exceeds maximum sample limit ({int(MAX_ANALYSIS_DURATION_SEC)}s)"
+                )
+                return result
             rms = librosa.feature.rms(y=mono)[0]
             result["rms_db"] = round(
                 float(librosa.amplitude_to_db(np.array([max(float(np.mean(rms)), 1e-12)]))[0]), 2

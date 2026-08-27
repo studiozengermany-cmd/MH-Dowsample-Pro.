@@ -7,9 +7,11 @@ import organize
 from organize import run_pipeline
 
 
-def _controlled_worker(path, _site, _staging_dir, _dry_run, conn):
+def _controlled_worker(path, _site, staging_dir, _dry_run, conn):
     try:
         if "hang" in str(path):
+            staged = staging_dir / f"{path.stem}.processed.wav"
+            staged.write_text("fake processed audio data")
             time.sleep(10)
         else:
             conn.send({"status": "error", "error": "controlled fast failure"})
@@ -21,7 +23,7 @@ def test_worker_timeout_and_batch_continues(tmp_path, monkeypatch):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
     input_dir.mkdir()
-    
+
     # Create two fake audio files
     file1 = input_dir / "hang.mp3"
     file1.write_text("fake audio data")
@@ -29,6 +31,8 @@ def test_worker_timeout_and_batch_continues(tmp_path, monkeypatch):
     file2.write_text("fake audio data")
 
     monkeypatch.setattr(organize, "_worker_process_file", _controlled_worker)
+    temp_root = tmp_path / "temp"
+    monkeypatch.setattr(organize, "TEMP_ROOT", temp_root)
 
     # Run pipeline with a 2-second timeout and two concurrent workers.
     counts = asyncio.run(
@@ -45,7 +49,11 @@ def test_worker_timeout_and_batch_continues(tmp_path, monkeypatch):
     assert counts["file_timeout"] == 1
     # The fast file should fail cleanly
     assert (counts["rejected"] + counts["error"]) == 1
-    
+
+    # Staged files left behind by the killed worker must be cleaned up
+    leftovers = list(temp_root.rglob("hang.processed*.wav"))
+    assert leftovers == [], f"Found leaked staged files: {leftovers}"
+
     # Ensure no processes are left alive
     active_children = multiprocessing.active_children()
     assert len(active_children) == 0, f"Found leaked processes: {active_children}"

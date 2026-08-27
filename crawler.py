@@ -251,6 +251,50 @@ def _response_audio_suffix(response: requests.Response, url: str) -> str:
     return _CONTENT_TYPE_SUFFIXES.get(content_type, ".bin")
 
 
+class BaseAudioExtractor:
+    """Base interface for site-specific or generic audio extractors."""
+
+    def supports(self, url: str) -> bool:
+        return False
+
+    async def extract(self, crawler: AudioCrawler, page_url: str) -> list[str]:
+        raise NotImplementedError
+
+
+class SpliceExtractor(BaseAudioExtractor):
+    def supports(self, url: str) -> bool:
+        hostname = (urlparse(url).hostname or "").lower()
+        return hostname == "splice.com" or hostname.endswith(".splice.com")
+
+    async def extract(self, crawler: AudioCrawler, page_url: str) -> list[str]:
+        stop = threading.Event()
+        worker = asyncio.create_task(asyncio.to_thread(crawler._discover_splice_pages, page_url, stop))
+        try:
+            assets = await asyncio.wait_for(asyncio.shield(worker), timeout=CRAWL_TIMEOUT_SEC)
+        except (TimeoutError, asyncio.CancelledError):
+            stop.set()
+            try:
+                await worker
+            except Exception:
+                pass
+            raise
+        if assets:
+            for url, title in assets:
+                if title:
+                    crawler.discovered_titles.setdefault(url, title)
+            return [url for url, _title in assets]
+        return []
+
+
+class GenericWebExtractor(BaseAudioExtractor):
+    def supports(self, _url: str) -> bool:
+        # Fallback for any public sound website (Looperman, Cymatics, Freesound, Bandcamp, etc.)
+        return True
+
+    async def extract(self, crawler: AudioCrawler, page_url: str) -> list[str]:
+        return await crawler._sniff_urls(page_url)
+
+
 class AudioCrawler:
     _USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -258,7 +302,11 @@ class AudioCrawler:
     )
 
     def __init__(
-        self, download_dir: Path, gate: QualityGate | None = None, session: requests.Session | None = None
+        self,
+        download_dir: Path,
+        gate: QualityGate | None = None,
+        session: requests.Session | None = None,
+        extractors: list[BaseAudioExtractor] | None = None,
     ) -> None:
         configure_playwright_runtime()
         self.download_dir = download_dir
@@ -269,6 +317,9 @@ class AudioCrawler:
         self.profile_dir = BROWSER_PROFILE_DIR
         self._browser_lock = asyncio.Lock()
         self.discovered_titles: dict[str, str] = {}
+        self.extractors: list[BaseAudioExtractor] = (
+            list(extractors) if extractors is not None else [SpliceExtractor(), GenericWebExtractor()]
+        )
 
     async def sniff_urls(self, page_url: str) -> list[str]:
         validate_public_url(page_url)
@@ -299,27 +350,18 @@ class AudioCrawler:
     async def _discover_urls(self, page_url: str) -> list[str]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CRAWL_TIMEOUT_SEC
-        if self._is_splice_url(page_url):
-            stop = threading.Event()
-            worker = asyncio.create_task(asyncio.to_thread(self._discover_splice_pages, page_url, stop))
-            try:
-                assets = await asyncio.wait_for(asyncio.shield(worker), timeout=CRAWL_TIMEOUT_SEC)
-            except (TimeoutError, asyncio.CancelledError):
-                stop.set()
-                try:
-                    await worker
-                except Exception:
-                    pass
-                raise
-            if assets:
-                for url, title in assets:
-                    if title:
-                        self.discovered_titles.setdefault(url, title)
-                return [url for url, _title in assets]
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            raise TimeoutError
-        return await asyncio.wait_for(self._sniff_urls(page_url), timeout=remaining)
+        # Extractor registry: site-specific fast paths first, generic sniffer last.
+        for extractor in self.extractors:
+            if not extractor.supports(page_url):
+                continue
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            urls = await asyncio.wait_for(extractor.extract(self, page_url), timeout=remaining)
+            if urls:
+                return urls
+        host = urlparse(page_url).hostname or "unknown"
+        raise NoAudioFoundError(f"No public audio assets were discovered on {host}")
 
     def _discover_splice_pages(
         self,
