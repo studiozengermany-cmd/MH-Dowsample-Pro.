@@ -52,3 +52,24 @@ Mọi AI hoặc người tiếp quản dự án BẮT BUỘC đọc file này tr
   · Muốn thêm trang web có API/phân trang đặc thù, chỉ cần tạo subclass kế thừa `BaseAudioExtractor` và truyền vào `AudioCrawler(extractors=[...])`.
 
 ---
+
+## [2026-08-28 02:50] — Commit & Push code lên GitHub (origin main)
+🕐 Thời gian: 2026-08-28 02:50 (+07:00)
+👤 Thực hiện bởi: Claude Code (qwen-max)
+🧩 Loại: CONFIG
+🎯 Mục đích: Đẩy toàn bộ thay đổi (Extractor đa nguồn, dọn staging file timeout, giới hạn audio duration, cập nhật contract tests) lên GitHub repo `studiozengermany-cmd/MH-Dowsample-Pro` để chuẩn bị kéo về VPS.
+📂 File đã tác động:
+  · Nhật ký.md — Thêm entry ghi nhận hành động commit & push.
+✅ Đã giải quyết:
+  · Commit `414ab71` đã push thành công lên `origin main`.
+  · Toàn bộ test suite 158/158 PASS trước khi push.
+🧪 Đã kiểm tra thế nào:
+  · Lệnh đã chạy: `git push origin main`
+  · Kết quả thật: `fccfd70..414ab71 main -> main` (Thành công).
+⚠️ Còn hạn chế / chưa làm:
+  · Chưa pull trên VPS và chưa đổi Telegram Bot Token trên BotFather.
+📝 Lưu ý cho người tiếp theo:
+  · Khi SSH vào VPS, dùng lệnh `git pull origin main` để cập nhật.
+  · Cập nhật lại SHA256 contract test nếu có sửa đổi thêm core files.
+
+---
