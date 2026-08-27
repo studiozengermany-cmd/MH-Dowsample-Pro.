@@ -73,3 +73,24 @@ Mọi AI hoặc người tiếp quản dự án BẮT BUỘC đọc file này tr
   · Cập nhật lại SHA256 contract test nếu có sửa đổi thêm core files.
 
 ---
+
+## [2026-08-28 06:30] — Đính chính giờ thực hiện entry 02:40 và 02:50
+🕐 Thời gian: 2026-08-28 06:30 (+07:00)
+👤 Thực hiện bởi: Claude Code (qwen-max)
+🧩 Loại: REVERT
+🎯 Mục đích: Đính chính thời gian thực tế của hai entry FEATURE (02:40) và CONFIG (02:50) — giờ ghi ban đầu sai so với timestamp commit thật.
+📂 File đã tác động:
+  · Nhật ký.md — Thêm entry đính chính.
+✅ Đã giải quyết:
+  · Entry `[2026-08-28 02:40]` (Mở rộng Extractor đa nguồn): thời gian thực tế là **06:25** — tương ứng commit `414ab71` (git timestamp 2026-08-28 06:25:10 +07:00).
+  · Entry `[2026-08-28 02:50]` (Commit & Push): thời gian thực tế là **06:28** — tương ứng commit `2bdbe86` (git timestamp 2026-08-28 06:28:44 +07:00).
+  · Entry `[2026-08-28 01:15]` (FIX) giữ nguyên — chưa có bằng chứng ngược.
+🧪 Đã kiểm tra thế nào:
+  · Lệnh đã chạy: `git log --format="%h %ci %s"`
+  · Kết quả thật: `414ab71 2026-08-28 06:25:10` và `2bdbe86 2026-08-28 06:28:44`.
+⚠️ Còn hạn chế / chưa làm:
+  · Không có.
+📝 Lưu ý cho người tiếp theo:
+  · Giờ entry nên lấy từ `Get-Date` / `git log` timestamp thay vì ước lượng.
+
+---
