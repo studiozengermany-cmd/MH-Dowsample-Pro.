@@ -94,3 +94,33 @@ Mọi AI hoặc người tiếp quản dự án BẮT BUỘC đọc file này tr
   · Giờ entry nên lấy từ `Get-Date` / `git log` timestamp thay vì ước lượng.
 
 ---
+
+## [2026-08-29 03:28] — Test chuyên nghiệp toàn diện & Setup Telegram Bot Token
+🕐 Thời gian: 2026-08-29 03:28 (+07:00)
+👤 Thực hiện bởi: Claude Code (deepseek-v4-flash)
+🧩 Loại: TEST + CONFIG
+🎯 Mục đích: Hoàn thiện dự án bằng chiến dịch test chuyên nghiệp (Full A+B+C: E2E pipeline thật + bổ sung coverage bot/crawler + quality gate), đồng thời xác nhận và setup Telegram Bot Token mới.
+📂 File đã tác động:
+  · tests/test_bot_handlers.py — TẠO MỚI (11 test): access gate (PENDING/BLOCKED/REJECTED/REVOKED/APPROVED), invite-code flow, keyboard admin/public, main menu phân quyền, source_name_from_url, cmd_start chặn user chưa duyệt + hiện menu cho user đã duyệt.
+  · tests/test_generic_extractor.py — TẠO MỚI (3 test): GenericWebExtractor universal fallback, delegate browser sniffing, guard giới hạn crawl.
+  · data/reports/test-report.md — TẠO MỚI: báo cáo test chuyên nghiệp đầy đủ.
+  · .env — Xác nhận `TELEGRAM_TOKEN=8340122654:AAE...RQs` (token mới từ BotFather) đã đúng.
+✅ Đã giải quyết:
+  · Full suite: 158 → **172 passed** (11.14s), coverage **80%** (ngưỡng ≥68%).
+  · ruff: All checks passed. bandit (-ll): 0 issue. mypy: lỗi môi trường numpy pyi (cần Python ≥3.12, local đang 3.14.7) — không phải lỗi code.
+  · E2E: 10/10 MP3 thật → WAV chuẩn pcm_s16le/44100Hz/16-bit/stereo, phân loại đúng layout (FX/, Loops/House/, Loops/Trap/, Loops/Deep House/, Loops/Lo Fi/), key+BPM detection OK, phát hiện trùng lặp SHA-256 10/10, dùng isolated env (test_e2e/) KHÔNG đụng data production.
+  · Token Telegram Bot hợp lệ (getMe OK): **@MH_dowsample_bot** — "MH - Downsample Pro", id 8340122654. Admin user id: 8503737793.
+🧪 Đã kiểm tra thế nào:
+  · Lệnh đã chạy: `./.venv_new/Scripts/python.exe -m pytest tests -q --cov=. --cov-fail-under=68`
+  · Kết quả thật: **172 passed**, TOTAL 5047 stmts, 80% coverage.
+  · Lệnh lint: `ruff check *.py utils tools` -> All checks passed!
+  · Lệnh bandit: `bandit -r *.py utils tools -ll` -> 0 issue (set PYTHONIOENCODING=utf-8 để tránh lỗi charmap formatter trên console Windows).
+  · Xác thực token: `curl api.telegram.org/bot<TOKEN>/getMe` -> `{"ok":true,...}`
+⚠️ Còn hạn chế / chưa làm:
+  · `test_e2e/` (thư mục test tạm: 10 WAV, DB test, temp) còn trên đĩa — P3, xóa khi không cần.
+  · Worktree cũ `zealous-lederberg-cf0fdf` có 2 lỗi lint (benchmark_quality_gate.py) — P3.
+  · Coverage bot.py (58%) / crawler.py (63%) còn thấp — có thể bổ sung test handler callback (handle_access_callback, handle_url).
+  · Chưa test live bot chạy long-running với token mới (chỉ verify getMe).
+📝 Lưu ý cho người tiếp theo:
+  · Khi chạy bandit trên Windows console, set `PYTHONIOENCODING=utf-8` trước để formatter 'txt' không crash vì unicode.
+  · Bot token đã đổi — nếu khởi động bot.py cần chạy trong terminal có PYTHONIOENCODING=utf-8 để tránh lỗi encode khi in emoji/Vietnamese.
