@@ -503,24 +503,27 @@ class DeliveryService:
                 for archive_path in archive_paths:
                     archive_count += 1
                     part_number = archive_count
+                    try:
+                        zip_size_mb = archive_path.stat().st_size / (1024 * 1024)
+                    except OSError:
+                        zip_size_mb = 0.0
                     if len(batch) == manifest.ready_count and len(archive_paths) == 1:
-                        heading = f"✅ <b>Đã gom gọn {manifest.ready_count} sample</b>\n"
-                    else:
-                        heading = (
-                            "✅ <b>Gói sample đã sẵn sàng</b> — "
-                            f"gói <b>{part_number}</b>\n"
-                        )
-                    if self.original_files:
+                        # Single ZIP — all files fit in one archive
                         caption = (
-                            heading
-                            + f"• File gốc: <b>{manifest.ready_count}</b>"
-                            + "\nTên file nguồn được giữ nguyên."
+                            f"✅ <b>Đã tải xong {manifest.ready_count} sample</b>\n"
+                            + f"🌐 <b>Nguồn:</b> {html.escape(site)}\n"
+                            + f"🎵 <b>File gốc:</b> {manifest.ready_count} samples\n"
+                            + f"💾 <b>Dung lượng ZIP:</b> {zip_size_mb:.1f} MB\n"
+                            + ("📂 Tên file nguồn được giữ nguyên." if self.original_files else "📁 Giữ nguyên thư mục phân loại.")
                         )
                     else:
+                        # Multi-part delivery
                         caption = (
-                            heading
-                            + "\n".join(_status_lines(manifest))
-                            + "\nCác file trong gói giữ nguyên thư mục phân loại."
+                            f"📦 <b>Gói {part_number}</b> — <b>{html.escape(site)}</b>\n"
+                            + f"🎵 <b>File trong gói:</b> {len(batch)} samples\n"
+                            + f"💾 <b>Dung lượng ZIP:</b> {zip_size_mb:.1f} MB\n"
+                            + (f"📊 <b>Tổng toàn bộ:</b> {manifest.ready_count} samples\n" if manifest.ready_count > len(batch) else "")
+                            + ("📂 Tên file nguồn được giữ nguyên." if self.original_files else "📁 Giữ nguyên thư mục phân loại.")
                         )
                     try:
                         sent = await self.send_archive_with_retry(
@@ -535,6 +538,7 @@ class DeliveryService:
                         sent_parts.append(part_number)
                     else:
                         failed_parts.append(part_number)
+
                     # Free each ZIP before building the next batch. The organized
                     # library file is never touched by this cleanup.
                     cleanup_archives([archive_path])

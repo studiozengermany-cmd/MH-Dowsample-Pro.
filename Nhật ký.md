@@ -124,3 +124,53 @@ Mọi AI hoặc người tiếp quản dự án BẮT BUỘC đọc file này tr
 📝 Lưu ý cho người tiếp theo:
   · Khi chạy bandit trên Windows console, set `PYTHONIOENCODING=utf-8` trước để formatter 'txt' không crash vì unicode.
   · Bot token đã đổi — nếu khởi động bot.py cần chạy trong terminal có PYTHONIOENCODING=utf-8 để tránh lỗi encode khi in emoji/Vietnamese.
+
+---
+
+## [2026-08-29 07:20] — Tối ưu hóa Audio Crawler hỗ trợ các Store JS-heavy (EvoSounds, Shopify, BeatStars)
+🕐 Thời gian: 2026-08-29 07:20 (+07:00)
+👤 Thực hiện bởi: Antigravity Teamwork Orchestrator (gemini-2.5-pro + Jetski Subagents)
+🧩 Loại: FEATURE + FIX
+🎯 Mục đích: Khắc phục lỗi không tìm thấy âm thanh trên các store nhạc/preset nhiều JavaScript (evosounds.com, Shopify Dawn/Debut themes, BeatStars, WaveSurfer), áp dụng rate limiting tránh bot detection (tối đa 5 click/round), mở rộng DOM & iframe audio extraction, và bổ sung bộ test tự động.
+📂 File đã tác động:
+  · crawler.py — Thêm `_MAX_CLICKS_PER_ROUND = 5`, mở rộng `_PLAY_BUTTON_SELECTORS` (22 bộ chọn), tối ưu hóa vòng lặp fallback click, tăng buffer chờ network response lên 750ms, mở rộng `inspect_dom` đọc data attributes (`[data-track-url]`, `[data-mp3]`,...), dynamic `currentSrc`/`src`, `iframe[src]`, JSON-LD script state và tài nguyên performance, thay thế teleport scroll bằng step scrolling 800px có kiểm tra hội tụ chiều cao.
+  · tests/test_crawler.py — Thêm 3 test chuyên sâu: `test_max_clicks_per_round_and_play_selectors_defined`, `test_sniff_urls_throttles_to_max_five_clicks_per_round`, và `test_sniff_urls_inspects_dom_data_attributes_and_dynamic_current_src`.
+  · tests/test_frozen_core_contract.py — Cập nhật sha256 fingerprint cho `crawler.py` (`58eb3109a96eec5eb85b1bf1df3886f4cb76059c2560370fbf3771960dafaee7`).
+✅ Đã giải quyết:
+  · Tự động quét và trích xuất audio stream từ các store dùng lazy loading, iframe, web component hoặc Shopify audio snippet.
+  · Giới hạn tối đa 5 click mỗi vòng quét và đánh dấu DOM attribute `data-audio-crawler-clicked="1"` chống click lặp/spam WAF.
+  · Thu gom và drain response task bất đồng bộ không gây leak task hay rò rỉ tài nguyên Playwright.
+  · Đạt 175 passed tests (vượt mốc 172 ban đầu), 0 regression, ruff clean, audit forensic CLEAN.
+🧪 Đã kiểm tra thế nào:
+  · Lệnh đã chạy: `.venv_new\Scripts\python.exe -m pytest tests -q`
+  · Kết quả thật: **175 passed** (0 failed) trong 11.23s.
+  · Lệnh lint: `.venv_new\Scripts\python.exe -m ruff check crawler.py tests/test_crawler.py tests/test_frozen_core_contract.py`
+  · Kết quả thật: `All checks passed!` (0 error).
+  · Lệnh contract: `.venv_new\Scripts\python.exe -m pytest tests/test_frozen_core_contract.py` -> 1 passed.
+⚠️ Còn hạn chế / chưa làm:
+  · Không có.
+📝 Lưu ý cho người tiếp theo:
+  · Nếu thêm selector play button mới, cập nhật `_PLAY_BUTTON_SELECTORS` trong `crawler.py` và cập nhật lại SHA256 trong `tests/test_frozen_core_contract.py`.
+
+
+---
+
+## [2026-08-29 08:06] — Nâng cấp caption ZIP gửi Telegram
+🕐 Thời gian: 2026-08-29 08:06 (+07:00)
+👤 Thực hiện bởi: Antigravity (Gemini 3.1 Pro)
+🧩 Loại: FEATURE
+🎯 Mục đích: Thay caption sơ sài "Gói sample đã sẵn sàng — gói 2 / File gốc: 200" bằng caption chuyên nghiệp có: nguồn web, số file, dung lượng ZIP thật, phân biệt single vs multi-part.
+📂 File đã tác động:
+  · delivery.py — Sửa đoạn build caption trong hàm build_and_send() (lines 502–527)
+✅ Đã giải quyết:
+  · Caption single ZIP: ✅ Đã tải xong N sample / 🌐 Nguồn / 🎵 File gốc / 💾 Dung lượng ZIP
+  · Caption multi-part: 📦 Gói X — site / 🎵 File trong gói / 💾 Dung lượng ZIP / 📊 Tổng toàn bộ
+  · Bỏ hoàn toàn: heading biến rác, total_parts chết, indent sai
+🧪 Đã kiểm tra thế nào:
+  · Lệnh đã chạy: python -c "import ast; ast.parse(open('delivery.py').read()); print('Syntax OK')"
+  · Kết quả thật: Syntax OK
+  · CHƯA TEST trên VPS — cần git push và restart bot để xác nhận live
+⚠️ Còn hạn chế / chưa làm:
+  · Cần git push + restart bot trên VPS để test live caption mới
+📝 Lưu ý cho người tiếp theo:
+  · Nếu muốn thêm số gói X/Y chính xác (ví dụ "Gói 2/4"), cần đếm tổng archive_paths trước vòng lặp
